@@ -71,6 +71,9 @@ type LayerCache struct {
 
 	mu       sync.Mutex
 	verified map[string]verifiedLayer
+	// keepBlobs keeps the original compressed layer blobs in blobs/sha256.
+	// See EnableBlobStore.
+	keepBlobs bool
 }
 
 // verifiedLayer records a layer that passed its integrity verification in this
@@ -343,6 +346,19 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	// The hash covers every byte that the compiler and the final drain read,
 	// so it equals the hash of the whole stream.
 	digester := digest.SHA256.Digester()
+	var blob *os.File
+	if c.keepBlobs {
+		if blob, err = c.createTempBlob(); err != nil {
+			return "", CompileStats{}, err
+		}
+		defer func() {
+			if blob != nil {
+				_ = blob.Close()
+				_ = os.Remove(blob.Name())
+			}
+		}()
+		src = io.TeeReader(src, blob)
+	}
 	in := &hashingReader{r: newBoundedReader(src, "compressed layer size", c.limits.MaxBlobBytes, nil), h: digester.Hash()}
 	var diff *diffVerifier
 	if spec.diffID != "" {
@@ -363,6 +379,12 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	}
 	if hexKey == "" {
 		hexKey = stats.SHA256Hex
+	}
+	if blob != nil {
+		if err := c.publishBlob(blob, digester.Digest().Encoded()); err != nil {
+			return "", CompileStats{}, err
+		}
+		blob = nil
 	}
 
 	if err := tmp.Sync(); err != nil {
