@@ -93,6 +93,9 @@ type server struct {
 	stateDir   string
 	exe        string
 	arch       string
+	// stopGrace is the time that stop waits for the supervisor after the
+	// timeout of the container, before it kills the supervisor.
+	stopGrace time.Duration
 }
 
 func newServer(cache *oci.LayerCache, builder builderStarter, containers *containerStore, runtime containerRuntime, stateDir string) *server {

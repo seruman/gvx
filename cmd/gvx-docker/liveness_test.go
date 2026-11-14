@@ -51,9 +51,43 @@ func TestHelperProcess(t *testing.T) {
 		_, _ = os.Stdout.WriteString("ready " + strconv.Itoa(child.Process.Pid) + "\n")
 		time.Sleep(time.Minute)
 		os.Exit(0)
+	case "hold-lock":
+		// Hold the lock as a supervisor does, until a signal ends the
+		// process.
+		lock, err := acquireSupervisorLock(os.Getenv("GVX_DOCKER_TEST_DIR"))
+		if err != nil {
+			os.Exit(3)
+		}
+		defer lock.release()
+		_, _ = os.Stdout.WriteString("ready\n")
+		time.Sleep(time.Minute)
+		os.Exit(0)
 	case "exit":
 		os.Exit(0)
+	case "sleep":
+		time.Sleep(time.Minute)
+		os.Exit(0)
 	}
+}
+
+// startLockHolder starts a helper process that holds the supervisor lock of
+// dir, and returns after the lock is held.
+func startLockHolder(t *testing.T, dir string) *exec.Cmd {
+	t.Helper()
+	cmd := helperCommand(t, "hold-lock", "GVX_DOCKER_TEST_DIR="+dir)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	if n, _ := out.Read(buf); strings.TrimSpace(string(buf[:n])) != "ready" {
+		t.Fatalf("lock holder said %q", buf[:n])
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return cmd
 }
 
 func helperCommand(t *testing.T, mode string, env ...string) *exec.Cmd {

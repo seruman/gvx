@@ -180,6 +180,7 @@ func shimCommand(ctx context.Context, args []string, stderr io.Writer) int {
 		fs.BoolVar(&opts.idle, "idle", false, "Run the idle program in place of the container command")
 		fs.StringVar(&opts.control, "control", "", "Control socket path")
 		fs.IntVar(&opts.netFD, "net-fd", -1, "Inherited descriptor of the supervisor network connection")
+		fs.IntVar(&opts.lifeFD, "life-fd", -1, "Inherited read end of the supervisor pipe")
 	})
 	if code != 0 {
 		return code
@@ -242,10 +243,17 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 	stdout := logWriter{log: logFile, stream: "stdout"}
 	stderr := logWriter{log: logFile, stream: "stderr"}
 
+	// One channel takes the stop and kill requests of the API process for
+	// the whole life of the supervisor, also between runs. Without a handler,
+	// SIGUSR1 would end the supervisor through its default action.
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGUSR1)
+	defer signal.Stop(sigs)
+
 	restarts := 0
 	backoff := 100 * time.Millisecond
 	for {
-		code, runErr := runShimProcess(ctx, exe, p, store, rec.ID, stdout, stderr)
+		code, runErr := runShimProcess(ctx, exe, p, store, rec.ID, stdout, stderr, sigs)
 		var restart bool
 		current, err := store.update(rec.ID, func(cur *containerRecord) error {
 			cur.State.Running = false
@@ -282,6 +290,10 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 		select {
 		case <-ctx.Done():
 			return nil
+		case sig := <-sigs:
+			if sig == syscall.SIGTERM || sig == syscall.SIGUSR1 {
+				return nil
+			}
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, 10*time.Second)
@@ -303,26 +315,35 @@ func shouldRestart(rec containerRecord, code, restarts int) bool {
 	}
 }
 
-func runShimProcess(ctx context.Context, exe string, p paths, store *containerStore, id string, stdout, stderr io.Writer) (int, error) {
+func runShimProcess(ctx context.Context, exe string, p paths, store *containerStore, id string, stdout, stderr io.Writer, sigs <-chan os.Signal) (int, error) {
 	cmd := exec.Command(exe, "shim", "-state-dir", p.stateDir, id)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	// The shim reads the end of this pipe as the death of its supervisor and
+	// kills the guest, so a shim never outlives a killed supervisor.
+	lifeRead, lifeWrite, err := os.Pipe()
+	if err != nil {
+		return 125, fmt.Errorf("create supervisor pipe: %w", err)
+	}
+	defer func() { _ = lifeWrite.Close() }()
+	cmd.ExtraFiles = []*os.File{lifeRead}
+	cmd.Args = []string{exe, "shim", "-life-fd", "3", "-state-dir", p.stateDir, id}
 	netConn, netChild, err := socketPair()
 	if err == nil {
-		cmd.Args = []string{exe, "shim", "-net-fd", "3", "-state-dir", p.stateDir, id}
-		cmd.ExtraFiles = []*os.File{netChild}
+		cmd.ExtraFiles = append(cmd.ExtraFiles, netChild)
+		cmd.Args = []string{exe, "shim", "-life-fd", "3", "-net-fd", "4", "-state-dir", p.stateDir, id}
 		netCtx, stopNet := context.WithCancel(context.Background())
 		defer stopNet()
 		go serveNetworkConn(netCtx, netConn, p.stateDir, store, id)
 	}
-	if err := cmd.Start(); err != nil {
-		if netChild != nil {
-			_ = netChild.Close()
-		}
-		return 125, fmt.Errorf("start shim: %w", err)
-	}
+	setParentDeathSignal(cmd)
+	startErr := cmd.Start()
+	_ = lifeRead.Close()
 	if netChild != nil {
 		_ = netChild.Close()
+	}
+	if startErr != nil {
+		return 125, fmt.Errorf("start shim: %w", startErr)
 	}
 	healthCtx, stopHealth := context.WithCancel(context.Background())
 	defer stopHealth()
@@ -344,54 +365,41 @@ func runShimProcess(ctx context.Context, exe string, p paths, store *containerSt
 	if err == nil {
 		go runHealthChecks(healthCtx, p.stateDir, store, rec)
 	}
-	sigs := make(chan os.Signal, 4)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	defer signal.Stop(sigs)
-	stopSig := linuxSIGTERM
-	if rec, err := store.get(id); err == nil && rec.Config.StopSignal != "" {
-		if n, err := parseSignal(rec.Config.StopSignal); err == nil {
-			stopSig = n
-		}
-	}
-	stopSent := false
-	sendStop := func() {
-		if stopSent {
-			return
-		}
-		stopSent = true
-		if stopSig == linuxSIGKILL {
-			// The shim turns SIGUSR2 into a SIGKILL of the guest.
-			_ = cmd.Process.Signal(syscall.SIGUSR2)
-			return
-		}
-		conn, _, err := controlCall(context.Background(), controlSocketPath(p.stateDir, id), controlRequest{Op: "signal", Signal: stopSig})
+	stop := shimStopper{shim: cmd.Process, signalGuest: func(signo int) error {
+		conn, _, err := controlCall(context.Background(), controlSocketPath(p.stateDir, id), controlRequest{Op: "signal", Signal: signo})
 		if err != nil {
-			// The control socket is not up yet; SIGTERM reaches the guest
-			// as its Linux SIGTERM.
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			return
+			return err
 		}
-		_ = conn.Close()
-	}
+		return conn.Close()
+	}}
+	stop.signal, stop.timeout = stopSettings(store, id)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	defer func() { _ = os.Remove(controlSocketPath(p.stateDir, id)) }()
 	ctxDone := ctx.Done()
+	var escalate <-chan time.Time
 	for {
 		select {
 		case sig := <-sigs:
-			if sig == syscall.SIGTERM {
-				// docker stop: send the stop signal of the container.
-				sendStop()
-				continue
+			switch sig {
+			case syscall.SIGTERM:
+				// docker stop: send the stop signal, then kill the guest
+				// after the timeout that the API process recorded.
+				_, stop.timeout = stopSettings(store, id)
+				escalate = stop.begin()
+			case syscall.SIGUSR1:
+				// docker kill: kill the guest now.
+				escalate = stop.killGuest()
+			default:
+				_ = cmd.Process.Signal(sig)
 			}
-			_ = cmd.Process.Signal(sig)
 		case <-ctxDone:
 			// The parent context also ends on SIGTERM. A closed channel stays
-			// ready, so the loop stops reading it, and the stop signal goes
-			// out once.
+			// ready, so the loop stops reading it.
 			ctxDone = nil
-			sendStop()
+			escalate = stop.begin()
+		case <-escalate:
+			escalate = stop.next()
 		case err := <-done:
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
@@ -408,6 +416,82 @@ func runShimProcess(ctx context.Context, exe string, p paths, store *containerSt
 	}
 }
 
+// stopSettings returns the stop signal of container id as a Linux number and
+// the time that a stop waits before it kills the guest.
+func stopSettings(store *containerStore, id string) (int, time.Duration) {
+	signo, timeout := linuxSIGTERM, 10*time.Second
+	rec, err := store.get(id)
+	if err != nil {
+		return signo, timeout
+	}
+	if rec.Config.StopSignal != "" {
+		if n, err := parseSignal(rec.Config.StopSignal); err == nil {
+			signo = n
+		}
+	}
+	if rec.Config.StopTimeout != nil && *rec.Config.StopTimeout >= 0 {
+		timeout = time.Duration(*rec.Config.StopTimeout) * time.Second
+	}
+	if rec.State.StopTimeout != nil && *rec.State.StopTimeout >= 0 {
+		timeout = time.Duration(*rec.State.StopTimeout) * time.Second
+	}
+	return signo, timeout
+}
+
+// shimStopper ends one shim in steps: the stop signal of the container, then
+// a kill of the guest through SIGUSR2, then SIGKILL of the shim. It signals
+// only the shim process of this supervisor, which the supervisor has not
+// reaped, so the PID cannot name another process.
+type shimStopper struct {
+	shim        *os.Process
+	signalGuest func(int) error
+	signal      int
+	timeout     time.Duration
+	// step is 0 before the stop, 1 after the stop signal, 2 after the kill
+	// of the guest, and 3 after SIGKILL of the shim.
+	step int
+}
+
+// begin sends the stop signal once and returns the timer of the next step.
+func (st *shimStopper) begin() <-chan time.Time {
+	if st.step >= 1 {
+		return nil
+	}
+	st.step = 1
+	if st.signal == linuxSIGKILL {
+		return st.killGuest()
+	}
+	if err := st.signalGuest(st.signal); err != nil {
+		// The control socket is not up yet. SIGTERM of the shim reaches the
+		// guest as its Linux SIGTERM.
+		_ = st.shim.Signal(syscall.SIGTERM)
+	}
+	return time.After(st.timeout)
+}
+
+// killGuest makes the shim kill the guest with SIGKILL and close the sandbox,
+// so the volumes and the root image write their state.
+func (st *shimStopper) killGuest() <-chan time.Time {
+	if st.step >= 2 {
+		return nil
+	}
+	st.step = 2
+	_ = st.shim.Signal(syscall.SIGUSR2)
+	return time.After(shimKillGrace)
+}
+
+// next runs the step after a timer ends.
+func (st *shimStopper) next() <-chan time.Time {
+	switch st.step {
+	case 1:
+		return st.killGuest()
+	case 2:
+		st.step = 3
+		_ = st.shim.Kill()
+	}
+	return nil
+}
+
 // shimOptions selects a variant of the shim.
 type shimOptions struct {
 	// idle runs the idle program for a copy into a stopped container.
@@ -416,6 +500,9 @@ type shimOptions struct {
 	control string
 	// netFD is the inherited descriptor of the supervisor connection, or -1.
 	netFD int
+	// lifeFD is the inherited read end of the supervisor pipe, or -1. Its
+	// end means that the supervisor died.
+	lifeFD int
 }
 
 // runShim runs one sandbox in this process and returns the exit code of the
@@ -488,6 +575,11 @@ func runShim(ctx context.Context, p paths, store *containerStore, id string, opt
 	}
 	defer func() { _ = sb.Close() }()
 	go serveControlIO(sb, sio)
+	if opts.lifeFD >= 0 {
+		go watchSupervisor(os.NewFile(uintptr(opts.lifeFD), "gvx-docker-life"), func() {
+			_ = syscall.Kill(os.Getpid(), syscall.SIGUSR2)
+		})
+	}
 	// The lockdown denies file removal, so the supervisor removes the socket
 	// after the shim exits.
 
@@ -519,6 +611,17 @@ func runShim(ctx context.Context, p paths, store *containerStore, id string, opt
 		}
 	}()
 	return sb.Run(runCtx)
+}
+
+// watchSupervisor calls dead when the supervisor pipe ends. The supervisor
+// writes nothing, so a read returns only when every write end is closed: the
+// supervisor exited or died. The shim then kills its guest, as on SIGUSR2,
+// so a shim never outlives its supervisor.
+func watchSupervisor(life *os.File, dead func()) {
+	var b [1]byte
+	_, _ = life.Read(b[:])
+	_ = life.Close()
+	dead()
 }
 
 func sandboxConfig(rec containerRecord, rootfsPath, engineSocket string) (gvx.Config, error) {
