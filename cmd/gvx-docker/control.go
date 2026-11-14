@@ -381,6 +381,21 @@ func runControlExec(sb *gvx.Sandbox, conn net.Conn, reader *bufio.Reader, spec e
 }
 
 // dialControl connects to the control socket of a running container.
+// controlReplyTimeout bounds the wait for the reply line of a control call.
+// A shim answers at once, also for an exec or a dial: the wait for the guest
+// comes after the reply. A shorter deadline of the context wins.
+const controlReplyTimeout = 30 * time.Second
+
+// setReplyDeadline sets the read deadline of conn for the reply line: the
+// deadline of ctx, or controlReplyTimeout when that comes first.
+func setReplyDeadline(ctx context.Context, conn net.Conn) {
+	deadline := time.Now().Add(controlReplyTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetReadDeadline(deadline)
+}
+
 func dialControl(ctx context.Context, path string) (net.Conn, error) {
 	var d net.Dialer
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -402,16 +417,19 @@ func controlCall(ctx context.Context, path string, req controlRequest) (net.Conn
 		_ = conn.Close()
 		return nil, nil, err
 	}
+	setReplyDeadline(ctx, conn)
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		_ = conn.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("read the control reply: %w", err)
 	}
 	if err := parseControlResponse(line); err != nil {
 		_ = conn.Close()
 		return nil, nil, err
 	}
+	// The caller streams on the connection after the reply.
+	_ = conn.SetReadDeadline(time.Time{})
 	return conn, reader, nil
 }
 
@@ -531,15 +549,20 @@ func controlCallRaw(ctx context.Context, path string, req controlRequest) (net.C
 		_ = conn.Close()
 		return nil, err
 	}
+	setReplyDeadline(ctx, conn)
 	line, err := readLineUnbuffered(conn, 64<<10)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("read the control reply: %w", err)
 	}
 	if err := parseControlResponse(line); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	// The connection goes to another process, which streams on it. A
+	// deadline is a property of the socket in this process only, but clear
+	// it so no later use here sees it.
+	_ = conn.SetReadDeadline(time.Time{})
 	return conn, nil
 }
 
