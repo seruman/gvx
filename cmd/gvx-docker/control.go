@@ -95,8 +95,15 @@ func listenControl(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", path, err)
 	}
+	// Close of a Go Unix listener unlinks its path by default. The shim
+	// closes the listener after the lockdown, where unlinkat on AT_FDCWD is
+	// denied: Seatbelt returns an error, and the Linux seccomp filter kills
+	// the process with SIGSYS. The supervisor removes the file after the shim
+	// exits.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = ln.Close()
+		_ = os.Remove(path)
 		return nil, fmt.Errorf("restrict %s: %w", path, err)
 	}
 	return ln, nil
