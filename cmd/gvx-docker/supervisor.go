@@ -235,8 +235,23 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 		return err
 	}
 	defer lock.release()
-	if err := store.updateState(rec.ID, func(st *containerState) { st.StartPending = time.Time{} }); err != nil {
+	// A stop that came before the lock found no supervisor to signal, so it
+	// left only Stopping in the record. Honor it before the first run.
+	stopped := false
+	if err := store.updateState(rec.ID, func(st *containerState) {
+		st.StartPending = time.Time{}
+		if st.Stopping {
+			stopped = true
+			st.Running = false
+			st.Restarting = false
+			st.Status = "exited"
+			st.FinishedAt = time.Now().UTC()
+		}
+	}); err != nil {
 		return err
+	}
+	if stopped {
+		return nil
 	}
 	logFile, err := openRotatingLog(store.logPath(rec.ID), rec.HostConfig.LogConfig)
 	if err != nil {
