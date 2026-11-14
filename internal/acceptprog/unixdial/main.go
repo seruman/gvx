@@ -13,7 +13,9 @@
 // limitations under the License.
 
 // Command unixdial connects to the Unix socket of its first argument, sends
-// its second argument, closes its write side, and prints the reply.
+// its second argument, closes its write side, and prints the reply. With the
+// arguments "stat PATH" it prints the permission bits of PATH in octal. With
+// "hold PATH" it connects, sends one byte, and exits without a close.
 package main
 
 import (
@@ -24,6 +26,24 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "stat" {
+		info, err := os.Stat(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "stat:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%o", info.Mode().Perm())
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "hold" {
+		c, err := net.Dial("unix", os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "dial:", err)
+			os.Exit(1)
+		}
+		_, _ = c.Write([]byte{'x'})
+		os.Exit(0)
+	}
 	if len(os.Args) != 3 {
 		fmt.Fprintln(os.Stderr, "usage: unixdial PATH MESSAGE")
 		os.Exit(2)

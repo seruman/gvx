@@ -80,7 +80,7 @@ func (s *Sandbox) installUnixBridges(ctx context.Context, sctx, mntnsCtx gvconte
 			ep.Close(sctx)
 			return fmt.Errorf("gvx: the bridge endpoint of %s cannot be bound", b.GuestPath)
 		}
-		if err := vfsObj.MknodAt(sctx, creds, &pop, &vfs.MknodOptions{Mode: linux.S_IFSOCK | 0o666, Endpoint: bep}); err != nil {
+		if err := vfsObj.MknodAt(sctx, creds, &pop, &vfs.MknodOptions{Mode: linux.S_IFSOCK | 0o660, Endpoint: bep}); err != nil {
 			ep.Close(sctx)
 			return fmt.Errorf("gvx: create the bridge socket %s: %w", b.GuestPath, err)
 		}
@@ -193,6 +193,18 @@ func relayBridgeConn(ctx context.Context, sctx gvcontext.Context, ep transport.E
 	}
 	defer func() { _ = host.Close() }()
 	guest := guestStream{sctx: sctx, ep: ep}
+	// The run ends ctx. Close the host side then, so a host peer that keeps
+	// its connection open does not hold this relay after the guest is gone.
+	relayDone := make(chan struct{})
+	defer close(relayDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = host.Close()
+			ep.Shutdown(tcpip.ShutdownRead | tcpip.ShutdownWrite)
+		case <-relayDone:
+		}
+	}()
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(host, guest)
