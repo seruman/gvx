@@ -22,7 +22,9 @@ import (
 )
 
 // setParentDeathSignal makes the kernel send SIGUSR2 to the shim when its
-// supervisor dies. The shim kills the guest on SIGUSR2.
+// supervisor dies. The shim kills the guest on SIGUSR2. Linux sends the
+// signal when the thread that started the shim exits, not the process
+// (golang/go#27505). The supervisor pipe covers that case.
 func setParentDeathSignal(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}

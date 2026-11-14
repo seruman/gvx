@@ -618,35 +618,26 @@ func runShim(ctx context.Context, p paths, store *containerStore, id string, opt
 	}
 	defer func() { _ = sb.Close() }()
 	go serveControlIO(sb, sio)
-	if opts.lifeFD >= 0 {
-		go watchSupervisor(os.NewFile(uintptr(opts.lifeFD), "gvx-docker-life"), func() {
-			_ = syscall.Kill(os.Getpid(), syscall.SIGUSR2)
-		})
-	}
 	// The lockdown denies file removal, so the supervisor removes the socket
 	// after the shim exits.
 
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGUSR2, syscall.SIGWINCH, syscall.SIGCONT)
 	defer signal.Stop(sigs)
+	if opts.lifeFD >= 0 {
+		// The end of the supervisor pipe takes the path of SIGUSR2 in this
+		// process. A kill(2) of the shim itself would need a host call that
+		// the Linux seccomp filter denies after the lockdown.
+		go watchSupervisor(os.NewFile(uintptr(opts.lifeFD), "gvx-docker-life"), supervisorDeathHandler(sb.Signal))
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		for {
 			select {
 			case sig := <-sigs:
-				s, ok := sig.(syscall.Signal)
-				if !ok {
-					continue
-				}
-				// SIGUSR2 stands for a SIGKILL of the guest. The shim
-				// survives it and closes the sandbox cleanly.
-				if s == syscall.SIGUSR2 {
-					_ = sb.Signal(linuxSIGKILL)
-					continue
-				}
-				if n, ok := hostToLinuxSignal[s]; ok {
-					_ = sb.Signal(n)
+				if s, ok := sig.(syscall.Signal); ok {
+					_ = guestSignalFor(s, sb.Signal)
 				}
 			case <-runCtx.Done():
 				return
@@ -654,6 +645,26 @@ func runShim(ctx context.Context, p paths, store *containerStore, id string, opt
 		}
 	}()
 	return sb.Run(runCtx)
+}
+
+// guestSignalFor sends the guest the Linux signal for the host signal s of
+// the shim. SIGUSR2 stands for a SIGKILL of the guest: the shim survives it
+// and closes the sandbox cleanly. It makes no host call itself, so it runs
+// after the lockdown.
+func guestSignalFor(s syscall.Signal, signal func(int) error) error {
+	if s == syscall.SIGUSR2 {
+		return signal(linuxSIGKILL)
+	}
+	if n, ok := hostToLinuxSignal[s]; ok {
+		return signal(n)
+	}
+	return nil
+}
+
+// supervisorDeathHandler returns the action of a shim whose supervisor died:
+// a SIGKILL of the guest through the sandbox, the path of SIGUSR2.
+func supervisorDeathHandler(signal func(int) error) func() {
+	return func() { _ = guestSignalFor(syscall.SIGUSR2, signal) }
 }
 
 // watchSupervisor calls dead when the supervisor pipe ends. The supervisor
