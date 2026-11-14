@@ -389,19 +389,32 @@ func runShimProcess(ctx context.Context, exe string, p paths, store *containerSt
 	if err == nil {
 		go runHealthChecks(healthCtx, p.stateDir, store, rec)
 	}
-	stop := shimStopper{shim: cmd.Process, signalGuest: func(signo int) error {
+	stop := &shimStopper{shim: cmd.Process, settings: func() (int, time.Duration) { return stopSettings(store, id) }, signalGuest: func(signo int) error {
 		conn, _, err := controlCall(context.Background(), controlSocketPath(p.stateDir, id), controlRequest{Op: "signal", Signal: signo})
 		if err != nil {
 			return err
 		}
 		return conn.Close()
 	}}
-	stop.signal, stop.timeout = stopSettings(store, id)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	defer func() { _ = os.Remove(controlSocketPath(p.stateDir, id)) }()
+	return superviseShim(ctx, cmd.Process, sigs, stop, done)
+}
+
+// superviseShim forwards signals to a running shim and ends it on a stop or
+// kill request. It returns the exit code of the shim. done receives the result
+// of the Wait for the shim.
+func superviseShim(ctx context.Context, shim *os.Process, sigs <-chan os.Signal, stop *shimStopper, done <-chan error) (int, error) {
 	ctxDone := ctx.Done()
 	var escalate <-chan time.Time
+	// keep replaces the escalation timer only with a new one. A step that
+	// does nothing returns nil, and that must not drop the pending timer.
+	keep := func(ch <-chan time.Time) {
+		if ch != nil {
+			escalate = ch
+		}
+	}
 	for {
 		select {
 		case sig := <-sigs:
@@ -409,19 +422,18 @@ func runShimProcess(ctx context.Context, exe string, p paths, store *containerSt
 			case syscall.SIGTERM:
 				// docker stop: send the stop signal, then kill the guest
 				// after the timeout that the API process recorded.
-				_, stop.timeout = stopSettings(store, id)
-				escalate = stop.begin()
+				keep(stop.begin())
 			case syscall.SIGUSR1:
 				// docker kill: kill the guest now.
-				escalate = stop.killGuest()
+				keep(stop.killGuest())
 			default:
-				_ = cmd.Process.Signal(sig)
+				_ = shim.Signal(sig)
 			}
 		case <-ctxDone:
-			// The parent context also ends on SIGTERM. A closed channel stays
-			// ready, so the loop stops reading it.
+			// One SIGTERM ends ctx and also arrives on sigs. A closed channel
+			// stays ready, so the loop stops reading it.
 			ctxDone = nil
-			escalate = stop.begin()
+			keep(stop.begin())
 		case <-escalate:
 			escalate = stop.next()
 		case err := <-done:
@@ -469,8 +481,12 @@ func stopSettings(store *containerStore, id string) (int, time.Duration) {
 type shimStopper struct {
 	shim        *os.Process
 	signalGuest func(int) error
-	signal      int
-	timeout     time.Duration
+	// settings returns the stop signal and the timeout. begin reads them at
+	// the time of the stop, so it uses the timeout that the API process
+	// recorded with the request.
+	settings func() (int, time.Duration)
+	signal   int
+	timeout  time.Duration
 	// step is 0 before the stop, 1 after the stop signal, 2 after the kill
 	// of the guest, and 3 after SIGKILL of the shim.
 	step int
@@ -482,6 +498,9 @@ func (st *shimStopper) begin() <-chan time.Time {
 		return nil
 	}
 	st.step = 1
+	if st.settings != nil {
+		st.signal, st.timeout = st.settings()
+	}
 	if st.signal == linuxSIGKILL {
 		return st.killGuest()
 	}
