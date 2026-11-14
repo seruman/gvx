@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/mm"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
 
@@ -89,20 +90,24 @@ func (s *Sandbox) Processes() ([]Process, error) {
 	ns := k.RootPIDNamespace()
 	var out []Process
 	for _, tg := range ns.ThreadGroups() {
+		// A thread group that exited and was reaped has no ID in the
+		// namespace, as control.Processes skips it.
+		pid := ns.IDOfThreadGroup(tg)
 		leader := tg.Leader()
-		if leader == nil {
+		if pid == 0 || leader == nil {
 			continue
 		}
-		p := Process{PID: int32(ns.IDOfThreadGroup(tg)), Command: leader.Name()}
+		p := Process{PID: int32(pid), Command: leader.Name()}
 		if parent := leader.Parent(); parent != nil {
 			p.PPID = int32(ns.IDOfThreadGroup(parent.ThreadGroup()))
 		}
 		p.UID = uint32(leader.Credentials().RealKUID)
 		cpu := tg.CPUStats()
 		p.CPU = cpu.UserTime + cpu.SysTime
-		if mm := leader.MemoryManager(); mm != nil {
+		if mm := taskMM(leader); mm != nil {
 			p.RSS = mm.ResidentSetSize()
-			p.Args = readArgs(leader)
+			p.Args = readArgs(leader, mm)
+			mm.DecUsers(k.SupervisorContext())
 		}
 		if len(p.Args) == 0 {
 			p.Args = []string{p.Command}
@@ -113,8 +118,22 @@ func (s *Sandbox) Processes() ([]Process, error) {
 	return out, nil
 }
 
-func readArgs(t *kernel.Task) []string {
-	mm := t.MemoryManager()
+// taskMM returns the memory manager of t with one more user, or nil when t
+// has none. The caller drops the user with DecUsers. A task changes its
+// memory manager on execve and exit, so the read holds the task lock, and the
+// user keeps the memory manager alive after it, as /proc does.
+func taskMM(t *kernel.Task) *mm.MemoryManager {
+	var m *mm.MemoryManager
+	t.WithMuLocked(func(t *kernel.Task) { m = t.MemoryManager() })
+	if m == nil || !m.IncUsers() {
+		return nil
+	}
+	return m
+}
+
+// readArgs reads the argument vector of t from the memory manager m, which
+// the caller holds with taskMM.
+func readArgs(t *kernel.Task, mm *mm.MemoryManager) []string {
 	start, end := mm.ArgvStart(), mm.ArgvEnd()
 	if end <= start || end-start > 64*1024 {
 		return nil
@@ -168,8 +187,9 @@ func (s *Sandbox) Usage() (Usage, error) {
 		u.CPU += cpu.UserTime + cpu.SysTime
 		u.PIDs++
 		if leader := tg.Leader(); leader != nil {
-			if mm := leader.MemoryManager(); mm != nil {
+			if mm := taskMM(leader); mm != nil {
 				rss += mm.ResidentSetSize()
+				mm.DecUsers(k.SupervisorContext())
 			}
 		}
 	}

@@ -851,3 +851,52 @@ func TestSandboxUnixBridgeServesGuestConnections(t *testing.T) {
 		t.Fatalf("guest = %d %q (stderr %q), want 0 %q", code, stdout, stderr, "pong:ping")
 	}
 }
+
+// TestSandboxProcessesWhileTheGuestForks reads the process list and the
+// usage of the guest many times while its processes start, exec, and exit.
+// Run it with -race. The memory manager of a task changes on execve and exit,
+// so a read without the task lock races with the task goroutine.
+func TestSandboxProcessesWhileTheGuestForks(t *testing.T) {
+	churn := acceptprog.BuildChurn(t, runtime.GOARCH)
+	cfg := hostTestConfig(t)
+	cfg.BinaryPath = churn
+	cfg.Argv = []string{"3000"}
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := sb.Run(context.Background())
+		done <- code
+	}()
+	// Exec waits for the guest to start, so the reads below run during the
+	// churn.
+	proc, err := sb.Exec(context.Background(), ExecConfig{Argv: []string{"/bin/app", "0"}})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	_ = proc.Wait()
+	reads := 0
+	for {
+		select {
+		case code := <-done:
+			if code != 0 {
+				t.Fatalf("churn exit = %d", code)
+			}
+			if reads < 50 {
+				t.Fatalf("only %d reads ran during the churn, want at least 50", reads)
+			}
+			return
+		default:
+		}
+		if _, err := sb.Processes(); err != nil && !errors.Is(err, ErrNotRunning) {
+			t.Fatalf("Processes: %v", err)
+		}
+		if _, err := sb.Usage(); err != nil && !errors.Is(err, ErrNotRunning) {
+			t.Fatalf("Usage: %v", err)
+		}
+		reads++
+	}
+}
