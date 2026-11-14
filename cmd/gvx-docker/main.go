@@ -130,6 +130,15 @@ func serveCommand(ctx context.Context, args []string, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
+	// One serve owns a state directory. A second one would remove the
+	// sockets of the first one and start a second builder on the same
+	// volume image.
+	stateLock, err := lockStateDir(p.stateDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: %v\n", err)
+		return 1
+	}
+	defer stateLock.release()
 	exe, err := os.Executable()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: find executable: %v\n", err)
