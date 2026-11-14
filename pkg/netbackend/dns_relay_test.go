@@ -478,6 +478,36 @@ func TestDNSRelayLookupHook(t *testing.T) {
 	}
 }
 
+func TestDNSRelayLocalNamesWinOverUpstream(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.1"))
+	nf := newTestForwarder(t, NATConfig{
+		LocalNames: func(_ context.Context, name string) ([]netip.Addr, bool) {
+			switch name {
+			case "db":
+				return []netip.Addr{netip.MustParseAddr("172.18.0.3")}, true
+			case "stopped":
+				return nil, true
+			}
+			return nil, false
+		},
+	}, srv.addr)
+
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(1, "DB.", dnsTypeA))
+	if got := answerIPs(t, resp); len(got) != 1 || got[0] != netip.MustParseAddr("172.18.0.3") {
+		t.Fatalf("local name answer = %v, want 172.18.0.3", got)
+	}
+	if resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(2, "stopped", dnsTypeA)); dnsRCode(resp) != dnsRCodeNX {
+		t.Fatalf("owned name without addresses: rcode = %d, want NXDOMAIN", dnsRCode(resp))
+	}
+	if srv.queries.Load() != 0 {
+		t.Fatalf("upstream saw %d queries for local names, want 0", srv.queries.Load())
+	}
+	resp = nf.handleDNSQuery(t.Context(), buildDNSQuery(3, "example.test", dnsTypeA))
+	if got := answerIPs(t, resp); len(got) != 1 || got[0] != netip.MustParseAddr("198.51.100.1") {
+		t.Fatalf("other name = %v, want the upstream answer", got)
+	}
+}
+
 func TestDNSRelayRejectsMalformedQueries(t *testing.T) {
 	nf := newTestForwarder(t, NATConfig{})
 	if resp := nf.handleDNSQuery(t.Context(), []byte{1, 2, 3}); resp != nil {

@@ -324,6 +324,7 @@ type dnsRelay struct {
 	ipv6Enabled bool
 	isolateLAN  bool
 	lookupHost  func(ctx context.Context, host string) ([]netip.Addr, error)
+	localNames  func(ctx context.Context, name string) ([]netip.Addr, bool)
 	servers     []string
 	dials       []func(ctx context.Context, network, addr string) (net.Conn, error)
 	log         *slog.Logger
@@ -349,6 +350,7 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		ipv6Enabled: nf.hasGuestIPv6(),
 		isolateLAN:  nf.cfg.IsolateLAN,
 		lookupHost:  nf.cfg.LookupHost,
+		localNames:  nf.cfg.LocalNames,
 		servers:     nf.upstreamDNS,
 		dials:       []func(context.Context, string, string) (net.Conn, error){dialFn},
 		log:         nf.log,
@@ -426,7 +428,7 @@ func (r dnsRelay) answerQuery(ctx context.Context, req []byte, viaTCP bool) []by
 	name := q.Name.String()
 
 	if q.Class == dnsmessage.ClassINET {
-		if addrs, found, owned := r.lookupOwnName(name); owned {
+		if addrs, found, owned := r.lookupLocalName(ctx, name); owned {
 			if !found {
 				return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeNameError)
 			}
@@ -485,6 +487,25 @@ func (r dnsRelay) lookupOwnName(qname string) (addrs []netip.Addr, found, owned 
 		}
 	case "gvx":
 		return r.gvxAddrs, true, true
+	}
+	return nil, false, false
+}
+
+// lookupLocalName resolves the names that the relay answers without the
+// upstream servers: the internal names, then the names of LocalNames. A local
+// name exists for every query type. An AAAA query for a name with only IPv4
+// addresses gets an empty answer, not NXDOMAIN, which glibc takes as the end
+// of the lookup.
+func (r dnsRelay) lookupLocalName(ctx context.Context, qname string) (addrs []netip.Addr, found, owned bool) {
+	if addrs, found, owned := r.lookupOwnName(qname); owned {
+		return addrs, found, owned
+	}
+	if r.localNames == nil {
+		return nil, false, false
+	}
+	clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(qname)), ".")
+	if addrs, ok := r.localNames(ctx, clean); ok {
+		return addrs, len(addrs) > 0, true
 	}
 	return nil, false, false
 }
