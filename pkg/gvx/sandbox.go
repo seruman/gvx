@@ -105,6 +105,9 @@ type Sandbox struct {
 	// execStdioMinor is the next free stdio device minor number of an exec
 	// process. The main process uses 0 to 2.
 	execStdioMinor uint32
+	// freeStdio holds the retired stdio devices of exec processes that ended.
+	// Guarded by mu.
+	freeStdio []stdioSet
 	// hostRAM is the memory of the host, read before the lockdown.
 	hostRAM           uint64
 	activeWatchdog    *watchdog.Watchdog

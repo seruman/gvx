@@ -38,6 +38,7 @@ import (
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // requireGuestBackend skips a test that runs a guest when the host has no
@@ -899,4 +900,58 @@ func TestSandboxProcessesWhileTheGuestForks(t *testing.T) {
 		}
 		reads++
 	}
+}
+
+// TestSandboxRepeatedExecsReuseStdioDevices runs many execs one after the
+// other, as health checks do. Each exec must give its stdio devices back, so
+// the number of registered devices stays bounded and no device keeps the
+// streams of an exec that ended.
+func TestSandboxRepeatedExecsReuseStdioDevices(t *testing.T) {
+	churn := acceptprog.BuildChurn(t, runtime.GOARCH)
+	cfg := hostTestConfig(t)
+	cfg.BinaryPath = churn
+	cfg.Argv = []string{"1000000"}
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	go func() { _, _ = sb.Run(context.Background()) }()
+	const execs = 50
+	for i := 0; i < execs; i++ {
+		var out bytes.Buffer
+		proc, err := sb.Exec(context.Background(), ExecConfig{Argv: []string{"/bin/app", "0"}, Stdout: &out})
+		if err != nil {
+			t.Fatalf("Exec %d: %v", i, err)
+		}
+		if code := proc.Wait(); code != 0 {
+			t.Fatalf("exec %d exit = %d", i, code)
+		}
+	}
+	sb.mu.Lock()
+	k := sb.activeKernel
+	sb.mu.Unlock()
+	if k == nil {
+		t.Fatal("the guest is not running")
+	}
+	execMinors := 0
+	_ = k.VFS().ForEachDevice(func(_ string, kind vfs.DeviceKind, major, minor uint32, _ uint16) error {
+		if kind == vfs.CharDevice && major == stdioDeviceMajor && minor >= 3 {
+			execMinors++
+		}
+		return nil
+	})
+	if execMinors > 3 {
+		t.Fatalf("%d exec stdio devices are registered after %d sequential execs, want 3", execMinors, execs)
+	}
+	for minor := uint32(3); minor < 6; minor++ {
+		dev, ok := k.VFS().GetRegisteredDevice(vfs.CharDevice, stdioDeviceMajor, minor).(*stdioDevice)
+		if !ok {
+			continue
+		}
+		if dev.writer != nil || dev.reader != nil {
+			t.Fatalf("stdio device %d keeps the streams of an exec that ended", minor)
+		}
+	}
+	_ = sb.Signal(int(syscall.SIGKILL))
 }

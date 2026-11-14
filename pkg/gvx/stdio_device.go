@@ -33,8 +33,12 @@ import (
 // the next three free minor numbers.
 const stdioDeviceMajor = 240
 
-// Open implements vfs.Device.Open.
+// Open implements vfs.Device.Open. It copies the streams of the device into
+// the new file description under devMu, so an exec that ends or reuses the
+// device never changes the streams of a description that is open already.
 func (d *stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	d.devMu.Lock()
+	defer d.devMu.Unlock()
 	fd := &stdioFD{
 		stream:       d.stream,
 		sharedOutErr: d.sharedOutErr,
@@ -50,7 +54,17 @@ func (d *stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dent
 	}); err != nil {
 		return nil, err
 	}
+	d.opens.Add(1)
 	return &fd.vfsfd, nil
+}
+
+// retire drops the streams of the device after its exec process ended. A
+// later open of the device node reads EOF and discards writes, so no guest
+// process reaches the streams of an exec that ended.
+func (d *stdioDevice) retire() {
+	d.devMu.Lock()
+	defer d.devMu.Unlock()
+	d.reader, d.writer, d.tty, d.pump = nil, nil, nil, nil
 }
 
 // openStdioFDs registers the stdio devices in vfsObj and returns the file
@@ -64,13 +78,22 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 // openStdioFDsAt is openStdioFDs with the device minor numbers firstMinor to
 // firstMinor+2.
 func openStdioFDsAt(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, firstMinor uint32, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, err error) {
+	devs := newStdioDevices(in, out, errw, tty, pump)
+	if err := registerStdioDevices(vfsObj, firstMinor, devs); err != nil {
+		return fds, err
+	}
+	return openStdioNodes(ctx, vfsObj, creds, firstMinor, tty != nil)
+}
+
+var stdioNames = [3]string{"stdin", "stdout", "stderr"}
+
+// newStdioDevices returns the devices of stdin, stdout, and stderr.
+func newStdioDevices(in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) [3]*stdioDevice {
 	devs := [3]*stdioDevice{
 		{stream: stdioStreamStdin, reader: in, pump: pump},
 		{stream: stdioStreamStdout, writer: out},
 		{stream: stdioStreamStderr, writer: errw},
 	}
-	names := [3]string{"stdin", "stdout", "stderr"}
-	flags := [3]uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_WRONLY}
 	if tty != nil {
 		sharedOutErr := errw == out
 		errMu := tty.outMu
@@ -82,17 +105,33 @@ func openStdioFDsAt(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds 
 			{stream: stdioStreamStdout, reader: in, writer: out, tty: tty, mu: tty.outMu},
 			{stream: stdioStreamStderr, sharedOutErr: sharedOutErr, reader: in, writer: errw, tty: tty, mu: errMu},
 		}
-		flags = [3]uint32{linux.O_RDWR, linux.O_RDWR, linux.O_RDWR}
 	}
-	for i, dev := range devs {
+	for _, dev := range devs {
 		if dev.mu == nil {
 			dev.mu = new(sync.Mutex)
 		}
+	}
+	return devs
+}
+
+// registerStdioDevices registers devs with the minor numbers firstMinor to
+// firstMinor+2.
+func registerStdioDevices(vfsObj *vfs.VirtualFilesystem, firstMinor uint32, devs [3]*stdioDevice) error {
+	for i, dev := range devs {
 		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, firstMinor+uint32(i), dev, &vfs.RegisterDeviceOptions{}); err != nil {
-			return fds, fmt.Errorf("gvx: register the %s device: %w", names[i], err)
+			return fmt.Errorf("gvx: register the %s device: %w", stdioNames[i], err)
 		}
 	}
+	return nil
+}
 
+// openStdioNodes creates the device nodes of the minor numbers firstMinor to
+// firstMinor+2 on a private tmpfs and opens them.
+func openStdioNodes(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, firstMinor uint32, terminal bool) (fds [3]*vfs.FileDescription, err error) {
+	flags := [3]uint32{linux.O_RDONLY, linux.O_WRONLY, linux.O_WRONLY}
+	if terminal {
+		flags = [3]uint32{linux.O_RDWR, linux.O_RDWR, linux.O_RDWR}
+	}
 	fs, rootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(ctx, vfsObj, creds, "", vfs.GetFilesystemOptions{})
 	if err != nil {
 		return fds, fmt.Errorf("gvx: create the stdio device filesystem: %w", err)
@@ -113,7 +152,7 @@ func openStdioFDsAt(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds 
 			}
 		}
 	}()
-	for i, name := range names {
+	for i, name := range stdioNames {
 		pop := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(name)}
 		if err := vfsObj.MknodAt(ctx, creds, pop, &vfs.MknodOptions{
 			Mode:     linux.S_IFCHR | 0o666,
@@ -129,4 +168,82 @@ func openStdioFDsAt(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds 
 		fds[i] = fd
 	}
 	return fds, nil
+}
+
+// stdioSet is the three stdio devices of one exec process.
+type stdioSet struct {
+	firstMinor uint32
+	devs       [3]*stdioDevice
+}
+
+// adopt points the devices of set at the streams of fresh when no guest file
+// description has any of them open. It reports whether it did. It holds the
+// lock of the three devices, so an Open runs either before the check, and
+// then the set stays retired, or after the new streams are in place.
+func (set stdioSet) adopt(fresh [3]*stdioDevice) bool {
+	in, out, errd := set.devs[0], set.devs[1], set.devs[2]
+	in.devMu.Lock()
+	defer in.devMu.Unlock()
+	out.devMu.Lock()
+	defer out.devMu.Unlock()
+	errd.devMu.Lock()
+	defer errd.devMu.Unlock()
+	if in.opens.Load() != 0 || out.opens.Load() != 0 || errd.opens.Load() != 0 {
+		return false
+	}
+	in.adoptLocked(fresh[0])
+	out.adoptLocked(fresh[1])
+	errd.adoptLocked(fresh[2])
+	return true
+}
+
+// adoptLocked copies the streams of f into d. The caller holds d.devMu.
+func (d *stdioDevice) adoptLocked(f *stdioDevice) {
+	d.stream, d.sharedOutErr = f.stream, f.sharedOutErr
+	d.reader, d.writer, d.tty, d.pump, d.mu = f.reader, f.writer, f.tty, f.pump, f.mu
+}
+
+// openExecStdio opens the stdio streams of an exec process. It reuses the
+// devices of an exec that ended when no guest file description holds them,
+// and registers three new devices otherwise, so the number of devices stays
+// bounded for any number of sequential execs. release retires the devices.
+func (s *Sandbox) openExecStdio(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, release func(), err error) {
+	fresh := newStdioDevices(in, out, errw, tty, pump)
+	var set stdioSet
+	reused := false
+	s.mu.Lock()
+	for i, free := range s.freeStdio {
+		if free.adopt(fresh) {
+			set, reused = free, true
+			s.freeStdio = append(s.freeStdio[:i], s.freeStdio[i+1:]...)
+			break
+		}
+	}
+	if !reused {
+		if s.execStdioMinor < 3 {
+			s.execStdioMinor = 3
+		}
+		set = stdioSet{firstMinor: s.execStdioMinor, devs: fresh}
+		s.execStdioMinor += 3
+	}
+	s.mu.Unlock()
+	if !reused {
+		if err := registerStdioDevices(vfsObj, set.firstMinor, set.devs); err != nil {
+			return fds, nil, err
+		}
+	}
+	release = func() {
+		for _, d := range set.devs {
+			d.retire()
+		}
+		s.mu.Lock()
+		s.freeStdio = append(s.freeStdio, set)
+		s.mu.Unlock()
+	}
+	fds, err = openStdioNodes(ctx, vfsObj, creds, set.firstMinor, tty != nil)
+	if err != nil {
+		release()
+		return fds, nil, err
+	}
+	return fds, release, nil
 }
