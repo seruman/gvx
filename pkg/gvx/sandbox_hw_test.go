@@ -771,11 +771,26 @@ func TestSandboxProcessesUsageAndUpperArchive(t *testing.T) {
 	if err != nil || usage.MemoryBytes == 0 || usage.PIDs != 1 || usage.MemoryLimit == 0 {
 		t.Fatalf("Usage = %+v, %v", usage, err)
 	}
+	// A Resume without a Pause must return an error. The kernel panics on
+	// an unmatched unpause, which would end the whole host process.
+	if err := sb.Resume(); !errors.Is(err, ErrNotPaused) {
+		t.Fatalf("Resume of a running guest = %v, want ErrNotPaused", err)
+	}
 	if err := sb.Pause(); err != nil {
 		t.Fatalf("Pause: %v", err)
 	}
+	// A second Pause is a no-op, so one Resume ends it.
+	if err := sb.Pause(); err != nil {
+		t.Fatalf("second Pause: %v", err)
+	}
 	if err := sb.Resume(); err != nil {
 		t.Fatalf("Resume: %v", err)
+	}
+	if err := sb.Resume(); !errors.Is(err, ErrNotPaused) {
+		t.Fatalf("second Resume = %v, want ErrNotPaused", err)
+	}
+	if _, err := sb.Processes(); err != nil {
+		t.Fatalf("Processes after Resume: %v", err)
 	}
 
 	var out bytes.Buffer
