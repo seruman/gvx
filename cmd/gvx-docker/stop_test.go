@@ -338,3 +338,26 @@ func TestSupervisorDeathBeforeGuestStartEndsTheRun(t *testing.T) {
 		t.Fatal("the run context stays open after the supervisor died before the guest started")
 	}
 }
+
+// TestControlListenerCloseKeepsTheSocketFile proves that closing the control
+// listener does not unlink its path. The shim closes the listener after the
+// lockdown, and the Linux seccomp filter kills the process for unlinkat on
+// AT_FDCWD. The supervisor removes the file after the shim exits.
+func TestControlListenerCloseKeepsTheSocketFile(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gvx-ctl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "run", "c.sock")
+	ln, err := listenControl(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("Close removed the control socket file: %v", err)
+	}
+}
