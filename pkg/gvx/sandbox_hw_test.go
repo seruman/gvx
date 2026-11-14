@@ -1046,3 +1046,60 @@ func TestSandboxArchiveOpensRefuseAFIFO(t *testing.T) {
 		}
 	}
 }
+
+// TestSandboxUnixBridgeModeAndLifetime checks two rules of a bridge socket.
+// Its node has mode 0660, as the Docker socket on a host, so an unprivileged
+// guest user cannot use the engine socket. And the host side of a bridge
+// connection closes when the run ends, even when the host peer never closes.
+func TestSandboxUnixBridgeModeAndLifetime(t *testing.T) {
+	requireGuestBackend(t)
+	dial := acceptprog.BuildUnixDial(t, runtime.GOARCH)
+	bridge := func(dialFn func(context.Context) (net.Conn, error)) []UnixBridge {
+		return []UnixBridge{{GuestPath: "/var/run/docker.sock", Dial: dialFn}}
+	}
+
+	cfg := hostTestConfig(t)
+	cfg.BinaryPath = dial
+	cfg.Argv = []string{"stat", "/var/run/docker.sock"}
+	cfg.UnixBridges = bridge(func(context.Context) (net.Conn, error) { return nil, errors.New("unused") })
+	if code, stdout, stderr := runConfig(t, cfg); code != 0 || stdout != "660" {
+		t.Fatalf("bridge socket mode = %q (exit %d, stderr %q), want 660", stdout, code, stderr)
+	}
+
+	hostEnds := make(chan net.Conn, 1)
+	cfg = hostTestConfig(t)
+	cfg.BinaryPath = dial
+	cfg.Argv = []string{"hold", "/var/run/docker.sock"}
+	cfg.UnixBridges = bridge(func(context.Context) (net.Conn, error) {
+		guestSide, hostSide := net.Pipe()
+		hostEnds <- hostSide
+		return guestSide, nil
+	})
+	if code, _, stderr := runConfig(t, cfg); code != 0 {
+		t.Fatalf("hold run exit %d, stderr %q", code, stderr)
+	}
+	var hostSide net.Conn
+	select {
+	case hostSide = <-hostEnds:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the guest connection did not reach the bridge")
+	}
+	defer hostSide.Close()
+	// The host peer reads and never closes. The bridge must close its side
+	// when the run ends, so the read returns.
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		for {
+			if _, err := hostSide.Read(buf); err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bridge kept the host connection open after the run ended")
+	}
+}
