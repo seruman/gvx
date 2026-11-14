@@ -206,7 +206,9 @@ func (s *server) pruneNetworks(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]any{"NetworksDeleted": deleted})
 }
 
-// attachNetwork adds an endpoint of network n to rec.
+// attachNetwork adds an endpoint of network n to rec without an address. The
+// store assigns the address when it writes the record, under the lock that
+// every process shares, so two creates cannot take one address.
 func (s *server) attachNetwork(rec *containerRecord, n networkRecord, aliases []string) error {
 	if rec.Networks == nil {
 		rec.Networks = map[string]endpointSettings{}
@@ -214,15 +216,7 @@ func (s *server) attachNetwork(rec *containerRecord, n networkRecord, aliases []
 	if _, ok := rec.Networks[n.Name]; ok {
 		return nil
 	}
-	records, err := s.containers.list()
-	if err != nil {
-		return err
-	}
-	ip, err := allocateIP(n, records)
-	if err != nil {
-		return err
-	}
-	rec.Networks[n.Name] = endpointSettings{NetworkID: n.ID, IPAddress: ip, Gateway: n.Gateway, Subnet: n.Subnet, Aliases: aliases, Internal: n.Internal}
+	rec.Networks[n.Name] = endpointSettings{NetworkID: n.ID, Gateway: n.Gateway, Subnet: n.Subnet, Aliases: aliases, Internal: n.Internal}
 	return nil
 }
 
@@ -247,17 +241,8 @@ func (s *server) connectNetwork(w http.ResponseWriter, r *http.Request, ref stri
 		writeStoreError(w, err)
 		return
 	}
-	if err := s.attachNetwork(&rec, n, req.EndpointConfig.Aliases); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	endpoint := rec.Networks[n.Name]
 	if _, err := s.containers.update(rec.ID, func(cur *containerRecord) error {
-		if cur.Networks == nil {
-			cur.Networks = map[string]endpointSettings{}
-		}
-		cur.Networks[n.Name] = endpoint
-		return nil
+		return s.attachNetwork(cur, n, req.EndpointConfig.Aliases)
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
