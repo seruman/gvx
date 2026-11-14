@@ -301,7 +301,7 @@ func (a *archive) compileOCILayers(layers []ocispec.Descriptor) ([]string, error
 			return nil, err
 		}
 		hexStr := l.Digest.Encoded()
-		if _, ok := a.cache.HasLayer(hexStr); !ok {
+		if a.cache.needsCompile(hexStr) {
 			sr, ok := a.reader(name)
 			if !ok {
 				return nil, fmt.Errorf("oci: layer blob %s is missing from the archive", l.Digest)

@@ -87,6 +87,12 @@ type RuntimeConfig struct {
 	// ExposedPorts holds the keys of the image ExposedPorts map, such as
 	// "80/tcp". ExposedPortList parses them.
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	// Volumes holds the guest paths that the image declares with VOLUME.
+	Volumes map[string]struct{} `json:"Volumes,omitempty"`
+	// Labels holds the labels of the image config.
+	Labels map[string]string `json:"Labels,omitempty"`
+	// StopSignal is the signal that stops the container, such as "SIGQUIT".
+	StopSignal string `json:"StopSignal,omitempty"`
 }
 
 // ExposedPort is one port that an image declares with EXPOSE.
@@ -240,6 +246,9 @@ func parseImageConfigFile(raw []byte, arch string, layers int) (ocispec.Image, R
 		WorkingDir:   parsed.Config.WorkingDir,
 		User:         parsed.Config.User,
 		ExposedPorts: parsed.Config.ExposedPorts,
+		Volumes:      parsed.Config.Volumes,
+		Labels:       parsed.Config.Labels,
+		StopSignal:   parsed.Config.StopSignal,
 	}
 	if cfg.WorkingDir == "" {
 		cfg.WorkingDir = "/"
@@ -477,7 +486,7 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 		if err := checkLayerDescriptor(l, cache.limits); err != nil {
 			return nil, err
 		}
-		if _, ok := cache.HasLayer(hexStr); !ok {
+		if cache.needsCompile(hexStr) {
 			body, err := rc.openBlob(ctx, l.Digest.String())
 			if err != nil {
 				return nil, err

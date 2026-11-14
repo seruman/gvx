@@ -546,16 +546,25 @@ func RegistryConfigKey(server string) (string, error) {
 // credentials go only to the registry and to its token realm. A nil client
 // selects a default HTTP client. A refusal wraps ErrLoginRejected.
 func Login(ctx context.Context, store CredentialStore, client *http.Client, server string, cred Credentials) error {
+	baseURL, err := verifyLogin(ctx, client, server, cred)
+	if err != nil {
+		return err
+	}
+	return store.Save(ctx, baseURL, cred)
+}
+
+// verifyLogin proves cred to the registry and returns its base URL.
+func verifyLogin(ctx context.Context, client *http.Client, server string, cred Credentials) (string, error) {
 	if cred.isZero() {
-		return errors.New("oci: login needs a user name and a password")
+		return "", errors.New("oci: login needs a user name and a password")
 	}
 	baseURL, err := RegistryBaseURL(server)
 	if err != nil {
-		return err
+		return "", err
 	}
 	rc, err := newRegistryClient(client, baseURL, "", DefaultLimits(), nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer rc.close()
 	rc.fixed = &cred
@@ -565,22 +574,63 @@ func Login(ctx context.Context, store CredentialStore, client *http.Client, serv
 	if err != nil {
 		var status *StatusError
 		if errors.As(err, &status) && status.StatusCode == http.StatusUnauthorized {
-			return fmt.Errorf("%w: %s", ErrLoginRejected, rc.baseURL.Host)
+			return "", fmt.Errorf("%w: %s", ErrLoginRejected, rc.baseURL.Host)
 		}
-		return fmt.Errorf("oci: log in to %s: %w", rc.baseURL.Host, err)
+		return "", fmt.Errorf("oci: log in to %s: %w", rc.baseURL.Host, err)
 	}
 	status := resp.StatusCode
 	if err := resp.Body.Close(); err != nil {
-		return fmt.Errorf("oci: close response of %s: %w", ping, err)
+		return "", fmt.Errorf("oci: close response of %s: %w", ping, err)
 	}
 	switch {
 	case status == http.StatusOK:
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
-		return fmt.Errorf("%w: %s answered HTTP %d", ErrLoginRejected, rc.baseURL.Host, status)
+		return "", fmt.Errorf("%w: %s answered HTTP %d", ErrLoginRejected, rc.baseURL.Host, status)
 	default:
-		return &StatusError{URL: ping, StatusCode: status}
+		return "", &StatusError{URL: ping, StatusCode: status}
 	}
-	return store.Save(ctx, baseURL, cred)
+	return baseURL, nil
+}
+
+// VerifyLogin proves cred to the registry named by server, as Login does,
+// without storing it. An engine that receives the credentials of each request
+// from its client uses it.
+func VerifyLogin(ctx context.Context, client *http.Client, server string, cred Credentials) error {
+	_, err := verifyLogin(ctx, client, server, cred)
+	return err
+}
+
+type credentialsKey struct{}
+
+// WithCredentials returns a context whose registry requests to the registry
+// named by server use cred before the credential store. A Docker engine
+// passes the X-Registry-Auth credentials of one request this way.
+func WithCredentials(ctx context.Context, server string, cred Credentials) (context.Context, error) {
+	baseURL, err := RegistryBaseURL(server)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	table := map[string]Credentials{}
+	if prev, ok := ctx.Value(credentialsKey{}).(map[string]Credentials); ok {
+		for k, v := range prev {
+			table[k] = v
+		}
+	}
+	table[u.Host] = cred
+	return context.WithValue(ctx, credentialsKey{}, table), nil
+}
+
+func contextCredentials(ctx context.Context, host string) (Credentials, bool) {
+	table, ok := ctx.Value(credentialsKey{}).(map[string]Credentials)
+	if !ok {
+		return Credentials{}, false
+	}
+	cred, ok := table[host]
+	return cred, ok && !cred.isZero()
 }
 
 // Logout removes the stored credentials of the registry named by server. It

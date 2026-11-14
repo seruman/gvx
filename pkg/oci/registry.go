@@ -521,6 +521,9 @@ func (rc *registryClient) credentials(ctx context.Context) (Credentials, bool, e
 	if rc.fixed != nil {
 		return *rc.fixed, true, nil
 	}
+	if cred, ok := contextCredentials(ctx, rc.baseURL.Host); ok {
+		return cred, true, nil
+	}
 	if !rc.credsLoaded {
 		rc.cred, rc.haveCred, rc.credErr = rc.store.Lookup(ctx, rc.baseURL.String())
 		rc.credsLoaded = true
