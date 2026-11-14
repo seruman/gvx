@@ -62,6 +62,12 @@ func TestHelperProcess(t *testing.T) {
 		_, _ = os.Stdout.WriteString("ready\n")
 		time.Sleep(time.Minute)
 		os.Exit(0)
+	case "shim-stderr":
+		// Write to a stderr whose reader is gone, as a shim does after its
+		// supervisor died.
+		prepareShimProcess()
+		_, _ = os.Stderr.WriteString("gvx-docker: context canceled\n")
+		os.Exit(0)
 	case "exit":
 		os.Exit(0)
 	case "sleep":

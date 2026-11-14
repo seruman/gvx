@@ -361,3 +361,22 @@ func TestControlListenerCloseKeepsTheSocketFile(t *testing.T) {
 		t.Fatalf("Close removed the control socket file: %v", err)
 	}
 }
+
+// TestShimSurvivesAStderrWithoutReader proves that a shim ends with its own
+// exit code when its supervisor, the reader of its stderr, is gone. Go sends
+// SIGPIPE for a write to a broken stderr, which would replace the exit status
+// of the shim.
+func TestShimSurvivesAStderrWithoutReader(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	cmd := helperCommand(t, "shim-stderr")
+	cmd.Stderr = w
+	err = cmd.Run()
+	_ = w.Close()
+	if err != nil {
+		t.Fatalf("shim helper ended with %v, want exit 0", err)
+	}
+}

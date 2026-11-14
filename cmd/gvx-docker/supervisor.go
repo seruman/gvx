@@ -174,7 +174,16 @@ func superviseCommand(ctx context.Context, args []string, stderr io.Writer) int 
 	return 0
 }
 
+// prepareShimProcess makes a write to a pipe without a reader return EPIPE.
+// The supervisor reads the stdout and stderr of the shim. When it dies, Go
+// would end the shim with SIGPIPE at its next write to them, before the
+// sandbox closes its volumes and root image.
+func prepareShimProcess() {
+	signal.Ignore(syscall.SIGPIPE)
+}
+
 func shimCommand(ctx context.Context, args []string, stderr io.Writer) int {
+	prepareShimProcess()
 	var opts shimOptions
 	p, id, code := parseContainerCommandWith("shim", args, stderr, func(fs *flag.FlagSet) {
 		fs.BoolVar(&opts.idle, "idle", false, "Run the idle program in place of the container command")
