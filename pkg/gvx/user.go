@@ -237,3 +237,21 @@ func resolveExecUser(spec string, passwd, group []byte) (execUser, error) {
 	}
 	return u, nil
 }
+
+// resolveGroup returns the group ID of a name of the guest /etc/group, or of a
+// number.
+func resolveGroup(spec string, group []byte) (uint32, error) {
+	if isDigits(spec) {
+		gid, ok := parseID(spec)
+		if !ok {
+			return 0, fmt.Errorf("group ID %q is out of range", spec)
+		}
+		return gid, nil
+	}
+	for _, e := range parseGroup(group) {
+		if e.name == spec {
+			return e.gid, nil
+		}
+	}
+	return 0, fmt.Errorf("%w %q in the guest /etc/group", errUnknownGroup, spec)
+}

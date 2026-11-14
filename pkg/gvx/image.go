@@ -260,6 +260,10 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 // the config of its image. The command follows Docker rules, and the caller
 // environment replaces the image values key by key.
 func (s *Sandbox) applyImageDefaults(img oci.RuntimeConfig) error {
+	if s.cfg.Idle && len(s.cfg.Argv) == 0 && len(img.Entrypoint) == 0 && len(img.Cmd) == 0 && len(s.cfg.Cmd) == 0 && !s.cfg.EntrypointSet {
+		// The idle program replaces the command, so an image without one runs.
+		s.cfg.Argv = []string{"gvx-idle"}
+	}
 	argv, err := composeCommand(img, commandSource{
 		Argv:          s.cfg.Argv,
 		Entrypoint:    s.cfg.Entrypoint,

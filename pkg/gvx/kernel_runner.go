@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -189,6 +190,23 @@ func createKernelMemoryFile(maxLoadBytes uint64) (*pgalloc.MemoryFile, error) {
 	return mf, nil
 }
 
+// limitSet returns the resource limits of the guest processes: the sandbox
+// defaults with Config.Ulimits applied.
+func (s *Sandbox) limitSet() (*limits.LimitSet, error) {
+	ls, err := createSandboxLimitSet()
+	if err != nil {
+		return nil, err
+	}
+	for name, u := range s.cfg.Ulimits {
+		lt, ok := limits.FromLinuxResourceName["RLIMIT_"+strings.ToUpper(name)]
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown ulimit %q", ErrInvalidConfig, name)
+		}
+		ls.SetUnchecked(lt, limits.Limit{Cur: limits.FromLinux(u.Soft), Max: limits.FromLinux(u.Hard)})
+	}
+	return ls, nil
+}
+
 func createSandboxLimitSet() (*limits.LimitSet, error) {
 	ls, err := limits.NewLinuxLimitSet()
 	if err != nil {
@@ -203,8 +221,13 @@ func createSandboxLimitSet() (*limits.LimitSet, error) {
 }
 
 func (s *Sandbox) setActiveKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
+	s.setActiveKernelWithThreadGroup(k, nil, dog)
+}
+
+func (s *Sandbox) setActiveKernelWithThreadGroup(k *kernel.Kernel, tg *kernel.ThreadGroup, dog *watchdog.Watchdog) {
 	s.mu.Lock()
 	s.activeKernel = k
+	s.activeThreadGroup = tg
 	s.activeWatchdog = dog
 	s.mu.Unlock()
 	if s.kernelReady != nil {
@@ -214,9 +237,25 @@ func (s *Sandbox) setActiveKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
 	}
 }
 
+// Signal sends signo to the main guest process. It returns ErrNotRunning when
+// Run has not started the guest or after the guest exited.
+func (s *Sandbox) Signal(signo int) error {
+	if signo <= 0 || signo > int(linux.SignalMaximum) {
+		return fmt.Errorf("%w: invalid signal %d", ErrInvalidConfig, signo)
+	}
+	s.mu.Lock()
+	k, tg := s.activeKernel, s.activeThreadGroup
+	s.mu.Unlock()
+	if k == nil || tg == nil {
+		return ErrNotRunning
+	}
+	return k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(signo)})
+}
+
 func (s *Sandbox) clearActiveKernel() {
 	s.mu.Lock()
 	s.activeKernel = nil
+	s.activeThreadGroup = nil
 	s.activeWatchdog = nil
 	s.mu.Unlock()
 }
@@ -242,6 +281,9 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		if detach := attachDebugLogSink(s.cfg.DebugLog); detach != nil {
 			defer detach()
 		}
+	}
+	if s.cfg.Idle {
+		argv = []string{"gvx-idle"}
 	}
 	if len(argv) == 0 {
 		return 1, fmt.Errorf("gvx: empty command vector")
@@ -288,6 +330,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	sctxWithRoot := vfs.WithRoot(sctx, root)
 
 	if err := s.setupKernelSubmountsAndFiles(sctxWithRoot, k.VFS(), creds, root); err != nil {
+		return 1, err
+	}
+	bridgeCtx, stopBridges := context.WithCancel(ctx)
+	defer stopBridges()
+	if err := s.installUnixBridges(bridgeCtx, sctxWithRoot, vfs.WithMountNamespace(sctxWithRoot, mntns), k.VFS(), creds, root, k); err != nil {
 		return 1, err
 	}
 
@@ -382,9 +429,21 @@ func (s *Sandbox) initKernelInstance(k *kernel.Kernel, tk *kernel.Timekeeper, cr
 // stdio descriptors, and limits, then creates the initial thread group in k.
 func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithRoot gvcontext.Context, k *kernel.Kernel, creds *auth.Credentials, mntns *vfs.MountNamespace, root vfs.VirtualDentry, argv []string) (*kernel.ThreadGroup, func(), error) {
 	vfsObj := k.VFS()
-	execPath, err := resolveGuestExecutable(sctxWithRoot, vfsObj, creds, root, argv[0], s.cfg.Envv)
-	if err != nil {
-		return nil, nil, err
+	var idleFile *vfs.FileDescription
+	var execPath string
+	var err error
+	if s.cfg.Idle {
+		idleFile, err = openIdleExecutable(sctx, vfsObj, creds, s.cfg.Architecture)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer idleFile.DecRef(sctx)
+		argv = []string{"gvx-idle"}
+	} else {
+		execPath, err = resolveGuestExecutable(sctxWithRoot, vfsObj, creds, root, argv[0], s.cfg.Envv)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	readGuest := buildCachedGuestReader(sctxWithRoot, vfsObj, creds, root, execPath)
 
@@ -399,8 +458,20 @@ func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithR
 		fdTable.DecRef(sctx)
 		return nil, nil, err
 	}
+	if tty != nil && s.cfg.TerminalLineDiscipline {
+		removeNode, err := exposeTerminal(sctx, vfsObj, creds, root, fdTable, tty)
+		if err != nil {
+			fdTable.DecRef(sctx)
+			return nil, cleanupStdio, err
+		}
+		stdioCleanup := cleanupStdio
+		cleanupStdio = func() {
+			removeNode()
+			stdioCleanup()
+		}
+	}
 
-	ls, err := createSandboxLimitSet()
+	ls, err := s.limitSet()
 	if err != nil {
 		fdTable.DecRef(sctx)
 		return nil, cleanupStdio, err
@@ -414,6 +485,7 @@ func (s *Sandbox) createInitialGuestProcess(ctx context.Context, sctx, sctxWithR
 	mntns.IncRef()
 	procArgs := kernel.CreateProcessArgs{
 		Filename:             execPath,
+		File:                 idleFile,
 		Argv:                 argv,
 		Envv:                 finalizeEnv(s.cfg.Envv, guestEnvDefaults{Home: user.Home, Hostname: s.hostname(), TTY: tty != nil}),
 		WorkingDirectory:     s.initialWorkingDir(),
@@ -532,7 +604,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	dog.Start()
 	defer dog.Stop()
 
-	s.setActiveKernel(k, dog)
+	s.setActiveKernelWithThreadGroup(k, tg, dog)
 	defer s.clearActiveKernel()
 
 	doneCh := make(chan struct{})
@@ -551,6 +623,9 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	tg.WaitExited()
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
+	// Release the upper layer before the kernel ends, so the last reference
+	// of the root file system goes with the guest.
+	s.setRootUpperDentry(k.SupervisorContext(), vfs.VirtualDentry{})
 	k.WaitExited()
 	s.ckptMu.Unlock()
 	close(doneCh)

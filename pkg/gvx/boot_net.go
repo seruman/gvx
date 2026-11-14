@@ -81,8 +81,10 @@ func populateDefaultEtcFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyst
 func (s *Sandbox) initNATStack() error {
 	natCfg := netbackend.NATConfig{
 		IsolateLAN:        s.cfg.IsolateLAN,
+		LoopbackToHost:    s.cfg.LoopbackToHost,
 		DNSServers:        s.cfg.HostDNSServers,
 		StreamInterceptor: s.cfg.StreamInterceptor,
+		LocalNames:        s.cfg.LocalNames,
 		Stack:             s.stackOptions(),
 		Tuning:            s.cfg.Tuning,
 	}
@@ -94,9 +96,30 @@ func (s *Sandbox) initNATStack() error {
 			return hostlockdown.DialContext(dctx, network, addr)
 		}
 	}
+	if route := s.cfg.NATDialContext; route != nil {
+		hostDial := natCfg.DialContext
+		if hostDial == nil {
+			var d net.Dialer
+			hostDial = d.DialContext
+		}
+		natCfg.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, handled, err := route(ctx, network, addr)
+			if handled {
+				return conn, err
+			}
+			return hostDial(ctx, network, addr)
+		}
+	}
 	st, fwd, err := netbackend.NewNATStack(natCfg)
 	if err != nil {
 		return err
+	}
+	if len(s.cfg.GuestAddresses) > 0 {
+		if err := netbackend.AddGuestAddresses(st, s.cfg.GuestAddresses); err != nil {
+			fwd.Close()
+			st.Close()
+			return fmt.Errorf("gvx: %w", err)
+		}
 	}
 	s.netStack = st
 	s.natForwarder = fwd

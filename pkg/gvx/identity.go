@@ -17,6 +17,7 @@ package gvx
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"strings"
 
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -33,7 +34,12 @@ const maxGuestIdentityFile = 1 << 20
 // /etc/group of the guest root. It returns the credentials of the process, which
 // are the root credentials of the kernel when the user is root with group 0.
 func (s *Sandbox) guestUser(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, root *auth.Credentials, rootDentry vfs.VirtualDentry) (execUser, *auth.Credentials, error) {
-	spec := s.cfg.User
+	return s.guestUserSpec(sctx, vfsObj, root, rootDentry, s.cfg.User)
+}
+
+// guestUserSpec resolves spec as guestUser does. An empty spec selects the
+// User of the image, and then root.
+func (s *Sandbox) guestUserSpec(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, root *auth.Credentials, rootDentry vfs.VirtualDentry, spec string) (execUser, *auth.Credentials, error) {
 	if spec == "" && s.resolvedImg != nil {
 		spec = s.resolvedImg.Config.User
 	}
@@ -48,6 +54,15 @@ func (s *Sandbox) guestUser(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	user, err := resolveExecUser(spec, passwd, group)
 	if err != nil {
 		return execUser{}, nil, fmt.Errorf("gvx: resolve user %q: %w", spec, err)
+	}
+	for _, g := range s.cfg.ExtraGroups {
+		gid, err := resolveGroup(g, group)
+		if err != nil {
+			return execUser{}, nil, fmt.Errorf("gvx: resolve group %q: %w", g, err)
+		}
+		if gid != user.GID && !slices.Contains(user.ExtraGIDs, gid) {
+			user.ExtraGIDs = append(user.ExtraGIDs, gid)
+		}
 	}
 	if user.UID == 0 && user.GID == 0 && len(user.ExtraGIDs) == 0 {
 		return user, root, nil

@@ -55,6 +55,7 @@ const (
 	goStaticPackage    = "z.gfire.dev/gvx/internal/acceptprog/gostatic"
 	volTreePackage     = "z.gfire.dev/gvx/internal/acceptprog/voltree"
 	fsFeaturesPackage  = "z.gfire.dev/gvx/internal/acceptprog/fsfeatures"
+	unixDialPackage    = "z.gfire.dev/gvx/internal/acceptprog/unixdial"
 	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
 	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
@@ -199,6 +200,14 @@ func download(url, path string) error {
 func BuildVolumeTree(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, volTreePackage, "voltree", goarch, 0)
+}
+
+// BuildUnixDial compiles the guest program unixdial for the Linux
+// architecture goarch and returns the path of the executable. The program
+// sends a message over a Unix socket and prints the reply.
+func BuildUnixDial(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, unixDialPackage, "unixdial", goarch, 0)
 }
 
 // BuildFSFeatures compiles the guest program fsfeatures for the Linux

@@ -29,7 +29,8 @@ import (
 
 // stdioDeviceMajor is a character device major number from the range that
 // Linux reserves for local and experimental use. The three stdio streams use
-// the minor numbers 0, 1, and 2.
+// the minor numbers 0, 1, and 2 for the main process. Each exec process uses
+// the next three free minor numbers.
 const stdioDeviceMajor = 240
 
 // Open implements vfs.Device.Open.
@@ -57,6 +58,12 @@ func (d *stdioDevice) Open(ctx gvcontext.Context, mnt *vfs.Mount, vfsd *vfs.Dent
 // private tmpfs that no mount namespace contains, so the guest sees the
 // streams only through its descriptor table.
 func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, err error) {
+	return openStdioFDsAt(ctx, vfsObj, creds, 0, in, out, errw, tty, pump)
+}
+
+// openStdioFDsAt is openStdioFDs with the device minor numbers firstMinor to
+// firstMinor+2.
+func openStdioFDsAt(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, firstMinor uint32, in io.Reader, out, errw io.Writer, tty *ttyState, pump *stdinPump) (fds [3]*vfs.FileDescription, err error) {
 	devs := [3]*stdioDevice{
 		{stream: stdioStreamStdin, reader: in, pump: pump},
 		{stream: stdioStreamStdout, writer: out},
@@ -81,7 +88,7 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 		if dev.mu == nil {
 			dev.mu = new(sync.Mutex)
 		}
-		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, uint32(i), dev, &vfs.RegisterDeviceOptions{}); err != nil {
+		if err := vfsObj.RegisterDevice(vfs.CharDevice, stdioDeviceMajor, firstMinor+uint32(i), dev, &vfs.RegisterDeviceOptions{}); err != nil {
 			return fds, fmt.Errorf("gvx: register the %s device: %w", names[i], err)
 		}
 	}
@@ -111,7 +118,7 @@ func openStdioFDs(ctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *a
 		if err := vfsObj.MknodAt(ctx, creds, pop, &vfs.MknodOptions{
 			Mode:     linux.S_IFCHR | 0o666,
 			DevMajor: stdioDeviceMajor,
-			DevMinor: uint32(i),
+			DevMinor: firstMinor + uint32(i),
 		}); err != nil {
 			return fds, fmt.Errorf("gvx: create the %s device node: %w", name, err)
 		}

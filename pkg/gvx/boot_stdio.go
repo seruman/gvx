@@ -563,7 +563,17 @@ func (f *stdioFD) Epollable() bool {
 	return f.tty != nil || f.pump != nil
 }
 
-func (f *stdioFD) Stat(_ gvcontext.Context, _ vfs.StatOptions) (linux.Statx, error) {
+func (f *stdioFD) Stat(ctx gvcontext.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	if f.tty != nil && f.vfsfd.Mount() != nil && f.tty.ktty != nil && f.tty.ktty.DeviceID() != 0 {
+		// A description opened through /dev/pts/N reports that node, so
+		// ttyname(3) finds the name of the terminal.
+		vd := f.vfsfd.VirtualDentry()
+		vfsObj := vd.Mount().Filesystem().VirtualFilesystem()
+		st, err := vfsObj.StatAt(ctx, auth.CredentialsFromContext(ctx), &vfs.PathOperation{Root: vd, Start: vd}, &opts)
+		if err == nil {
+			return st, nil
+		}
+	}
 	if f.tty != nil {
 		return linux.Statx{
 			Mask:      linux.STATX_BASIC_STATS,
@@ -847,7 +857,11 @@ func (s *Sandbox) setupKernelStdio(ctx context.Context, sctx gvcontext.Context, 
 	if s.cfg.TTY || isHostTerminalReader(s.cfg.Stdin) {
 		restoreTerm, rawHost := enterHostRawMode(s.cfg.Stdin, s.cfg.Stdout)
 		cleanups = append(cleanups, restoreTerm)
-		rows, cols, _ := hostTerminalSize(s.cfg.Stdin, s.cfg.Stdout)
+		rawHost = rawHost || s.cfg.TerminalLineDiscipline
+		rows, cols, ok := hostTerminalSize(s.cfg.Stdin, s.cfg.Stdout)
+		if !ok {
+			rows, cols = s.cfg.TerminalRows, s.cfg.TerminalCols
+		}
 		tty = newTTYState(s.cfg.Stdin, s.cfg.Stdout, rawHost, rows, cols)
 		stopWinch := watchHostWinch(ctx, s.cfg.Stdin, s.cfg.Stdout, func(r, c uint16) {
 			tty.setWinsize(linux.Winsize{Row: r, Col: c})
