@@ -47,6 +47,7 @@ var partitionOrder = []PartitionKind{
 // tier1Prefixes matches the additive package prefixes in tools/upstream/diff_audit.go.
 var tier1Prefixes = []string{
 	"cmd/rungv/",
+	"cmd/gvx-docker/",
 	"cmd/containerd-shim-gvx-v2/",
 	"pkg/gvx/",
 	"pkg/oci/",
