@@ -40,6 +40,10 @@ type builderProcess struct {
 
 	mu  sync.Mutex
 	cmd *exec.Cmd
+	// exited closes when the builder process in cmd ends. The goroutine that
+	// waits for the process closes it, so readers need no access to
+	// cmd.ProcessState.
+	exited chan struct{}
 }
 
 // ensure starts the builder sandbox when its socket does not accept a
@@ -49,7 +53,7 @@ func (b *builderProcess) ensure(ctx context.Context) error {
 		return nil
 	}
 	b.mu.Lock()
-	if b.cmd == nil || b.cmd.ProcessState != nil {
+	if b.cmd == nil || isClosed(b.exited) {
 		cmd := exec.Command(b.exe, "builder", "-state-dir", b.paths.stateDir, "-buildkit-image", b.paths.buildkitImage)
 		cmd.Stdout = b.log
 		cmd.Stderr = b.log
@@ -57,17 +61,45 @@ func (b *builderProcess) ensure(ctx context.Context) error {
 			b.mu.Unlock()
 			return fmt.Errorf("start builder: %w", err)
 		}
-		b.cmd = cmd
-		go func() { _ = cmd.Wait() }()
+		exited := make(chan struct{})
+		b.cmd, b.exited = cmd, exited
+		go func() {
+			_ = cmd.Wait()
+			close(exited)
+		}()
 	}
+	exited := b.exited
 	b.mu.Unlock()
-	return waitForSocket(ctx, b.paths.backendSock, 60*time.Second)
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-exited:
+			cancel()
+		case <-waitCtx.Done():
+		}
+	}()
+	err := waitForSocket(waitCtx, b.paths.backendSock, 60*time.Second)
+	if err != nil && isClosed(exited) && ctx.Err() == nil {
+		return errors.New("the BuildKit builder exited before it opened its socket; see the serve log")
+	}
+	return err
+}
+
+// isClosed reports whether ch is closed. A nil channel is open.
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *builderProcess) stop() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.cmd != nil && b.cmd.Process != nil && b.cmd.ProcessState == nil {
+	if b.cmd != nil && !isClosed(b.exited) {
 		_ = b.cmd.Process.Signal(os.Interrupt)
 	}
 }
