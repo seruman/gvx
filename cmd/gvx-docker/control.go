@@ -401,17 +401,9 @@ func controlCall(ctx context.Context, path string, req controlRequest) (net.Conn
 		_ = conn.Close()
 		return nil, nil, err
 	}
-	var resp controlResponse
-	if err := json.Unmarshal(line, &resp); err != nil {
+	if err := parseControlResponse(line); err != nil {
 		_ = conn.Close()
 		return nil, nil, err
-	}
-	if !resp.OK {
-		_ = conn.Close()
-		if resp.NotFound {
-			return nil, nil, &controlNotFoundError{resp.Error}
-		}
-		return nil, nil, errors.New(resp.Error)
 	}
 	return conn, reader, nil
 }
@@ -513,3 +505,65 @@ func (c *framedPacketConn) Read(p []byte) (int, error) {
 type controlNotFoundError struct{ msg string }
 
 func (e *controlNotFoundError) Error() string { return e.msg }
+
+// controlCallRaw sends req and returns the bare connection after an OK reply.
+// It reads the reply one byte at a time, so the bytes that the shim sends
+// after the reply stay in the socket. A caller that passes the connection to
+// another process, as a dial does, then loses none of them.
+func controlCallRaw(ctx context.Context, path string, req controlRequest) (net.Conn, error) {
+	conn, err := dialControl(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if _, err := conn.Write(append(data, '\n')); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	line, err := readLineUnbuffered(conn, 64<<10)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := parseControlResponse(line); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// readLineUnbuffered reads up to and with the first newline, one byte at a
+// time, and no byte after it.
+func readLineUnbuffered(r io.Reader, max int) ([]byte, error) {
+	var line []byte
+	var b [1]byte
+	for len(line) < max {
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return nil, err
+		}
+		line = append(line, b[0])
+		if b[0] == '\n' {
+			return line, nil
+		}
+	}
+	return nil, errors.New("control reply is too long")
+}
+
+// parseControlResponse returns the error of a control reply line.
+func parseControlResponse(line []byte) error {
+	var resp controlResponse
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return err
+	}
+	if resp.OK {
+		return nil
+	}
+	if resp.NotFound {
+		return &controlNotFoundError{resp.Error}
+	}
+	return errors.New(resp.Error)
+}
