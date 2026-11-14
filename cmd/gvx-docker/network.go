@@ -417,7 +417,9 @@ func answerNetwork(ctx context.Context, stateDir string, store *containerStore, 
 			dialReq.Src = netip.AddrPortFrom(src, req.SrcPort).String()
 			dialReq.Dst = net.JoinHostPort(req.Addr, strconv.Itoa(int(req.Port)))
 		}
-		conn, _, err := controlCall(ctx, controlSocketPath(stateDir, target.ID), dialReq)
+		// The bare connection goes to the shim of the caller, so no reply
+		// byte may stay in a buffer of this process.
+		conn, err := controlCallRaw(ctx, controlSocketPath(stateDir, target.ID), dialReq)
 		if err != nil {
 			return netResponse{Found: true, Error: err.Error()}, nil
 		}
