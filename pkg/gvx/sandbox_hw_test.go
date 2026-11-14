@@ -17,17 +17,23 @@
 package gvx
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	"z.gfire.dev/gvx/internal/acceptprog"
 	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
@@ -504,5 +510,329 @@ func TestSharedPageGuestELF64(t *testing.T) {
 	code, err := sb.Run(context.Background())
 	if err != nil || code != 0 || outBuf.String() != testelf.SharedPageOK {
 		t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), testelf.SharedPageOK)
+	}
+}
+
+// TestSandboxSignalStopsRunningGuest sends SIGTERM to a guest that waits for a
+// connection and checks its exit status.
+func TestSandboxSignalStopsRunningGuest(t *testing.T) {
+	serverELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, 18080, "/missing", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hostTestConfig(t)
+	cfg.NetworkMode = NetModeNAT
+	cfg.ELFBytes = serverELF
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	if err := sb.Signal(int(syscall.SIGTERM)); !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("Signal before Run = %v, want ErrNotRunning", err)
+	}
+	result := make(chan int, 1)
+	go func() {
+		code, _ := sb.Run(context.Background())
+		result <- code
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := sb.Signal(int(syscall.SIGTERM))
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrNotRunning) || time.Now().After(deadline) {
+			t.Fatalf("Signal while running = %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case code := <-result:
+		if code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("exit code = %d, want %d", code, 128+int(syscall.SIGTERM))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("guest did not exit after SIGTERM")
+	}
+}
+
+// TestSandboxExecRunsInRunningGuest starts a long-running guest, runs a second
+// process in it as soon as Run starts, and reads that process's output and
+// exit code. Exec waits for the guest, so the caller needs no retry.
+func TestSandboxExecRunsInRunningGuest(t *testing.T) {
+	serverELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, 18081, "/missing", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/server", Data: serverELF, Mode: 0o755},
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "data/note.txt", Data: []byte("from exec\n")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hostTestConfig(t)
+	cfg.NetworkMode = NetModeNAT
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.Argv = []string{"/bin/server"}
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	result := make(chan int, 1)
+	go func() {
+		code, _ := sb.Run(context.Background())
+		result <- code
+	}()
+	var out bytes.Buffer
+	execCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	proc, err := sb.Exec(execCtx, ExecConfig{Argv: []string{"/bin/cat", "/data/note.txt"}, Stdout: &out})
+	if err != nil {
+		t.Fatalf("Exec() = %v", err)
+	}
+	if code := proc.Wait(); code != 0 || out.String() != "from exec\n" {
+		t.Fatalf("exec = %d %q, want 0 %q", code, out.String(), "from exec\n")
+	}
+	if err := sb.Signal(int(syscall.SIGTERM)); err != nil {
+		t.Fatalf("Signal() = %v", err)
+	}
+	select {
+	case <-result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("guest did not exit after SIGTERM")
+	}
+}
+
+// TestSandboxArchiveRoundTripsInIdleGuest copies a tree into an idle guest
+// with an upper image, copies it back out, and reads it in a later run.
+func TestSandboxArchiveRoundTripsInIdleGuest(t *testing.T) {
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755}, testimage.File{Name: "srv", Type: '5', Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := filepath.Join(t.TempDir(), "rootfs.ext4")
+	cfg := hostTestConfig(t)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.RootfsUpperPath = upper
+	cfg.Idle = true
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	result := make(chan int, 1)
+	runErr := make(chan error, 1)
+	go func() {
+		code, err := sb.Run(context.Background())
+		runErr <- err
+		result <- code
+	}()
+	var in bytes.Buffer
+	tw := tar.NewWriter(&in)
+	modTime := time.Unix(1_700_000_000, 0)
+	for _, h := range []*tar.Header{
+		{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o750, Uid: 1000, Gid: 1000, ModTime: modTime},
+		{Name: "app/run.sh", Typeflag: tar.TypeReg, Mode: 0o755, Uid: 1000, Gid: 1000, Size: 5, ModTime: modTime},
+		{Name: "app/link", Typeflag: tar.TypeSymlink, Linkname: "run.sh", ModTime: modTime},
+	} {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Size > 0 {
+			_, _ = tw.Write([]byte("hello"))
+		}
+	}
+	_ = tw.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err = sb.ArchiveWrite("/srv", bytes.NewReader(in.Bytes()))
+		if !errors.Is(err, ErrNotRunning) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		select {
+		case rerr := <-runErr:
+			t.Fatalf("ArchiveWrite: %v; Run: %v code %d", err, rerr, <-result)
+		default:
+		}
+		t.Fatalf("ArchiveWrite: %v", err)
+	}
+	st, err := sb.StatPath("/srv/app/link")
+	if err != nil || st.LinkTarget != "run.sh" {
+		t.Fatalf("StatPath(link) = %+v, %v", st, err)
+	}
+	var out bytes.Buffer
+	if err := sb.ArchiveRead("/srv/app", &out); err != nil {
+		t.Fatalf("ArchiveRead: %v", err)
+	}
+	got := map[string]*tar.Header{}
+	tr := tar.NewReader(&out)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			break
+		}
+		got[h.Name] = h
+	}
+	if h := got["app/run.sh"]; h == nil || h.Mode != 0o755 || h.Uid != 1000 || h.Size != 5 || !h.ModTime.Equal(modTime) {
+		t.Fatalf("app/run.sh header = %+v", h)
+	}
+	if h := got["app/link"]; h == nil || h.Linkname != "run.sh" {
+		t.Fatalf("app/link header = %+v", h)
+	}
+	if _, err := sb.StatPath("/srv/missing"); !errors.Is(err, ErrPathNotFound) {
+		t.Fatalf("StatPath(missing) = %v, want ErrPathNotFound", err)
+	}
+	if err := sb.Signal(int(syscall.SIGKILL)); err != nil {
+		t.Fatalf("Signal: %v", err)
+	}
+	<-result
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	cfg = hostTestConfig(t)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.RootfsUpperPath = upper
+	cfg.Argv = []string{"/bin/cat", "/srv/app/run.sh"}
+	if code, stdout, stderr := runConfig(t, cfg); code != 0 || stdout != "hello" {
+		t.Fatalf("later run = %d %q (stderr %q), want 0 hello", code, stdout, stderr)
+	}
+}
+
+// TestSandboxProcessesUsageAndUpperArchive starts a guest that writes a root
+// file and waits, then reads its process list, its usage, and its changes.
+func TestSandboxProcessesUsageAndUpperArchive(t *testing.T) {
+	serverELF, err := testelf.BuildGuestHTTPServerELF64(runtime.GOARCH, 18083, "/missing", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/etc/changed.txt", "new\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/server", Data: serverELF, Mode: 0o755},
+		testimage.File{Name: "bin/write", Data: writeELF, Mode: 0o755},
+		testimage.File{Name: "etc", Type: '5', Mode: 0o755},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hostTestConfig(t)
+	cfg.NetworkMode = NetModeNAT
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.RootfsUpperPath = filepath.Join(t.TempDir(), "rootfs.ext4")
+	cfg.Argv = []string{"/bin/server"}
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	done := make(chan struct{})
+	go func() {
+		_, _ = sb.Run(context.Background())
+		close(done)
+	}()
+	var proc *ExecProcess
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		proc, err = sb.Exec(context.Background(), ExecConfig{Argv: []string{"/bin/write"}})
+		if err == nil || !errors.Is(err, ErrNotRunning) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code := proc.Wait(); code != 0 {
+		t.Fatalf("write exit = %d", code)
+	}
+
+	procs, err := sb.Processes()
+	if err != nil || len(procs) != 1 || procs[0].PID != 1 || procs[0].Args[0] != "/bin/server" {
+		t.Fatalf("Processes = %+v, %v, want one /bin/server at PID 1", procs, err)
+	}
+	usage, err := sb.Usage()
+	if err != nil || usage.MemoryBytes == 0 || usage.PIDs != 1 || usage.MemoryLimit == 0 {
+		t.Fatalf("Usage = %+v, %v", usage, err)
+	}
+	if err := sb.Pause(); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := sb.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := sb.ArchiveUpper(&out); err != nil {
+		t.Fatalf("ArchiveUpper: %v", err)
+	}
+	tr := tar.NewReader(&out)
+	found := false
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if h.Name == "etc/changed.txt" {
+			b, _ := io.ReadAll(tr)
+			found = string(b) == "new\n"
+		}
+	}
+	if !found {
+		t.Fatal("ArchiveUpper has no etc/changed.txt with the written content")
+	}
+	if err := sb.Signal(int(syscall.SIGKILL)); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+}
+
+// TestSandboxUnixBridgeServesGuestConnections publishes a bridge socket in the
+// guest, connects to it from the guest, and serves the connection on the host.
+func TestSandboxUnixBridgeServesGuestConnections(t *testing.T) {
+	requireGuestBackend(t)
+	dial := acceptprog.BuildUnixDial(t, runtime.GOARCH)
+	cfg := hostTestConfig(t)
+	cfg.BinaryPath = dial
+	cfg.Argv = []string{"/var/run/docker.sock", "ping"}
+	cfg.UnixBridges = []UnixBridge{{
+		GuestPath: "/var/run/docker.sock",
+		Dial: func(context.Context) (net.Conn, error) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			go func() {
+				defer ln.Close()
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				b, _ := io.ReadAll(c)
+				_, _ = c.Write(append([]byte("pong:"), b...))
+			}()
+			return net.Dial("tcp", ln.Addr().String())
+		},
+	}}
+	code, stdout, stderr := runConfig(t, cfg)
+	if code != 0 || stdout != "pong:ping" {
+		t.Fatalf("guest = %d %q (stderr %q), want 0 %q", code, stdout, stderr, "pong:ping")
 	}
 }

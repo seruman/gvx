@@ -17,7 +17,9 @@ package gvx
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"path"
+	"slices"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -174,15 +176,17 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 		}
 		s.rootUpperExisting = upperExisting
 	} else {
-		upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
+		upperFS, upperRootDentry, err := s.rootUpperFilesystem(sctx, vfsObj, creds)
 		if err != nil {
-			return nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
+			return nil, err
 		}
 		upperMnt := vfsObj.NewDisconnectedMount(upperFS, upperRootDentry, &vfs.MountOptions{})
 		upperFS.DecRef(sctx)
 		upperRoot = vfs.MakeVirtualDentry(upperMnt, upperRootDentry)
 	}
 	defer upperRoot.DecRef(sctx)
+	upperRoot.IncRef()
+	s.setRootUpperDentry(sctx, upperRoot)
 
 	mnt, err := vfsObj.MountDisconnected(sctx, creds, "overlay", "overlay", &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
@@ -308,6 +312,25 @@ func clearDirContents(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, cre
 	return nil
 }
 
+// rootUpperFilesystem returns the upper layer of the root overlay: the
+// ext4lite image of Config.RootfsUpperPath, or a tmpfs.
+func (s *Sandbox) rootUpperFilesystem(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.Filesystem, *vfs.Dentry, error) {
+	if s.rootUpper != nil {
+		fs, root, err := ext4lite.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
+			InternalData: ext4lite.InternalFilesystemOptions{Volume: s.rootUpper, UniqueID: "/"},
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("gvx: create ext4lite upper layer: %w", err)
+		}
+		return fs, root, nil
+	}
+	fs, root, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
+	}
+	return fs, root, nil
+}
+
 // mountEROFSLowerLayers mounts each EROFS layer from top to bottom and returns
 // their disconnected root dentries.
 func (s *Sandbox) mountEROFSLowerLayers(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, rootStats *blockdev.Stats) ([]vfs.VirtualDentry, error) {
@@ -397,7 +420,7 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		}
 		return nil
 	}
-	if err := mountStandardSubfilesystems(sctx, vfsObj, creds, root, mountSubfs); err != nil {
+	if err := mountStandardSubfilesystems(sctx, vfsObj, creds, root, s.cfg.ShmSizeBytes, mountSubfs); err != nil {
 		return err
 	}
 	if err := populateDefaultEtcFiles(sctx, vfsObj, creds, root, s.guestResolvConf); err != nil {
@@ -405,6 +428,11 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	}
 	if err := s.writeGuestHostFiles(sctx, vfsObj, creds, root); err != nil {
 		return err
+	}
+	for _, guestPath := range slices.Sorted(maps.Keys(s.cfg.GuestFiles)) {
+		if err := vfsWriteFile(sctx, vfsObj, creds, root, guestPath, s.cfg.GuestFiles[guestPath], 0o644); err != nil {
+			return fmt.Errorf("gvx: write guest file %s: %w", guestPath, err)
+		}
 	}
 	if err := s.installHostCACerts(sctx, vfsObj, creds, root); err != nil {
 		return err
@@ -416,9 +444,23 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 	// s.mounts is ordered by increasing path depth, so a mount point below
 	// another mount exists in that mount before the guest mounts there.
 	for _, m := range s.mounts {
+		var seed *seedSource
+		if m.SeedFromImage && !m.ReadOnly && m.Kind != MountTmpfs && !m.hostFile {
+			var err error
+			seed, err = openSeedSource(sctx, vfsObj, creds, root, m.GuestPath)
+			if err != nil {
+				return err
+			}
+		}
 		if err := s.mountUserMount(sctx, vfsObj, creds, root, m, mountSubfs, sharedRO); err != nil {
+			seed.release(sctx)
 			return err
 		}
+		if err := seed.copyInto(sctx, vfsObj, creds, root, m.GuestPath); err != nil {
+			seed.release(sctx)
+			return err
+		}
+		seed.release(sctx)
 	}
 
 	if s.cfg.ReadOnlyRoot {
@@ -453,7 +495,7 @@ func createDefaultGuestDirs(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 	return nil
 }
 
-func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
+func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry, shmSizeBytes int64, mountSubfs func(target, fsName string, opts *vfs.MountOptions) error) error {
 	dataOpts := func(data string) *vfs.MountOptions {
 		return &vfs.MountOptions{GetFilesystemOptions: vfs.GetFilesystemOptions{Data: data}}
 	}
@@ -478,7 +520,11 @@ func mountStandardSubfilesystems(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 	if err := mountSubfs("/dev/pts", "devpts", dataOpts("ptmxmode=0666,mode=0620")); err != nil {
 		return err
 	}
-	if err := mountSubfs("/dev/shm", "tmpfs", dataOpts("")); err != nil {
+	shmOpts := dataOpts("")
+	if shmSizeBytes > 0 {
+		shmOpts = dataOpts(tmpfsMountData(shmSizeBytes))
+	}
+	if err := mountSubfs("/dev/shm", "tmpfs", shmOpts); err != nil {
 		return err
 	}
 	// Docker mounts the cgroup2 hierarchy of a private cgroup namespace at
@@ -749,7 +795,7 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 		if isRegularFile(cmd) {
 			return cmd, nil
 		}
-		return "", fmt.Errorf("gvx: executable %q not found in guest rootfs", cmd)
+		return "", fmt.Errorf("%w: %q in guest rootfs", ErrExecutableNotFound, cmd)
 	}
 
 	pathEnv := defaultPath
@@ -770,7 +816,7 @@ func resolveGuestExecutable(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesyste
 		}
 	}
 
-	return "", fmt.Errorf("gvx: executable %q not found in PATH (%s)", cmd, pathEnv)
+	return "", fmt.Errorf("%w: %q in PATH (%s)", ErrExecutableNotFound, cmd, pathEnv)
 }
 
 func makeFPath(p string) fspath.Path {

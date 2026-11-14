@@ -241,3 +241,78 @@ func TestSandboxGuestWritesFollowMountAccess(t *testing.T) {
 		})
 	}
 }
+
+// TestSandboxRootfsUpperPersistsGuestWrites writes a root file in one run and
+// reads it in a second run with the same upper image.
+func TestSandboxRootfsUpperPersistsGuestWrites(t *testing.T) {
+	if !hvtest.Available() {
+		systraptest.Require(t)
+	}
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeELF, err := testelf.BuildGuestWriteFileELF64(runtime.GOARCH, "/etc/persisted.txt", "kept\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "bin/write", Data: writeELF, Mode: 0o755},
+		testimage.File{Name: "etc", Type: '5', Mode: 0o755},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := filepath.Join(t.TempDir(), "rootfs.ext4")
+	run := func(argv ...string) (int, string, string) {
+		cfg := hostTestConfig(t)
+		cfg.OCILayerTars = [][]byte{layer}
+		cfg.RootfsUpperPath = upper
+		cfg.Argv = argv
+		return runConfig(t, cfg)
+	}
+	if code, stdout, stderr := run("/bin/write"); code != 0 {
+		t.Fatalf("write run exit = %d (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	code, stdout, stderr := run("/bin/cat", "/etc/persisted.txt")
+	if code != 0 || stdout != "kept\n" {
+		t.Fatalf("read run = %d %q (stderr=%q), want 0 %q", code, stdout, stderr, "kept\n")
+	}
+}
+
+// TestSandboxSeedFromImageFillsEmptyVolume mounts an empty directory over an
+// image directory and reads the image file through the mount.
+func TestSandboxSeedFromImageFillsEmptyVolume(t *testing.T) {
+	if !hvtest.Available() {
+		systraptest.Require(t)
+	}
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(
+		testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755},
+		testimage.File{Name: "data/conf/app.conf", Data: []byte("from-image\n"), Mode: 0o640},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostDir := t.TempDir()
+	cfg := hostTestConfig(t)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.Mounts = []Mount{{Kind: MountBind, HostPath: hostDir, GuestPath: "/data", SeedFromImage: true}}
+	cfg.Argv = []string{"/bin/cat", "/data/conf/app.conf"}
+	if code, stdout, stderr := runConfig(t, cfg); code != 0 || stdout != "from-image\n" {
+		t.Fatalf("seeded read = %d %q (stderr %q)", code, stdout, stderr)
+	}
+	if b, err := os.ReadFile(filepath.Join(hostDir, "conf", "app.conf")); err != nil || string(b) != "from-image\n" {
+		t.Fatalf("host copy = %q, %v", b, err)
+	}
+	if err := os.WriteFile(filepath.Join(hostDir, "conf", "app.conf"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, stdout, _ := runConfig(t, cfg); code != 0 || stdout != "changed\n" {
+		t.Fatalf("second run = %d %q, want the volume content kept", code, stdout)
+	}
+}

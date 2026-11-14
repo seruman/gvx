@@ -890,6 +890,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/gvx"}, "pkg/marshal/primitive", "guest memory copies use primitive marshal types"},
 	{[]string{"pkg/gvx"}, "pkg/memutil", "kernel memory files require host memory views"},
 	{[]string{"pkg/gvx"}, "pkg/waiter", "stdio file descriptions implement waiter.Waitable for blocking reads"},
+	{[]string{"pkg/gvx"}, "pkg/syserr", "Unix bridge sockets read transport.Endpoint errors"},
 
 	// pkg/netbackend: Netstack foundation packages live outside pkg/tcpip.
 	{[]string{"pkg/netbackend"}, "pkg/buffer", "pkg/tcpip packets use pkg/buffer.Buffer values"},

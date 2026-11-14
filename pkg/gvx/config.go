@@ -17,6 +17,7 @@
 package gvx
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -128,6 +129,11 @@ func ParsePortForwardsWith(spec string, t tuning.Values) ([]PortForward, error) 
 	return out, nil
 }
 
+// Ulimit is a soft and a hard resource limit.
+type Ulimit struct {
+	Soft, Hard uint64
+}
+
 // Resources limits what the guest may use. A zero field means no limit.
 type Resources struct {
 	// MemoryBytes is the largest memory use of the guest. A value above zero
@@ -159,6 +165,11 @@ type Config struct {
 	// IsolateLAN blocks outbound NAT connections to RFC1918, loopback, and
 	// link-local LAN addresses when NetworkMode is NetModeNAT.
 	IsolateLAN bool
+
+	// LoopbackToHost sends a guest connection to a loopback port on which no
+	// guest socket listens to the same port on the host loopback, in NAT
+	// mode. IsolateLAN overrides it.
+	LoopbackToHost bool
 
 	// HostDNSServers lists the DNS servers of the host, each a bare IP or
 	// "ip:port". A bare IP uses port 53. When set, they replace the discovery
@@ -192,6 +203,38 @@ type Config struct {
 	// WireGuardConfig provides an in-memory WireGuard configuration when
 	// NetworkMode is NetModeWireGuard.
 	WireGuardConfig *netbackend.WireGuardConfig
+
+	// UnixBridges publishes Unix stream sockets at guest paths whose
+	// connections the embedder serves. Docker uses it for a bind of the
+	// engine socket into a container.
+	UnixBridges []UnixBridge
+
+	// GuestFiles writes files into the root file system of the guest before
+	// the guest starts, after the image defaults. The key is the absolute
+	// guest path. An embedder uses it for /etc/hosts and /etc/resolv.conf, as
+	// Docker writes them. The writes go to the upper layer, so the image
+	// stays unchanged.
+	GuestFiles map[string][]byte
+
+	// GuestAddresses adds addresses in CIDR form, such as "172.18.0.2/16", to
+	// eth0 in NAT mode. The guest keeps 10.0.2.15 for egress to the host. A
+	// connection to an address of these subnets leaves through NATDialContext,
+	// and the guest sees its own address of the subnet as the source. An
+	// embedder uses them for Docker networks, so a container sees the address
+	// that its peers use for it.
+	GuestAddresses []string
+
+	// LocalNames answers guest DNS queries for A and AAAA records before the
+	// upstream servers in NAT mode. It returns false for a name that it does
+	// not own. An embedder uses it for the names of other sandboxes.
+	LocalNames func(ctx context.Context, name string) ([]netip.Addr, bool)
+
+	// NATDialContext routes outbound NAT connections before the host dial. It
+	// receives the network and the host address that the NAT forwarder
+	// selected. It returns handled false to use the host dial. An embedder
+	// uses it to route the addresses of other sandboxes. It runs after the
+	// host lockdown, so it must not open host files.
+	NATDialContext func(ctx context.Context, network, addr string) (conn net.Conn, handled bool, err error)
 
 	// StreamInterceptor is an optional host-side L4/L7 proxy hook for outbound
 	// NAT streams.
@@ -243,6 +286,13 @@ type Config struct {
 	// /workspace when WorkspacePath is set.
 	Mounts []Mount
 
+	// RootfsUpperPath is the host path of an ext4lite image that stores the
+	// writes of the guest to its root file system. New creates a missing image
+	// file, but not its directory. The image persists the changes across runs
+	// of the same image. The empty string keeps the writes in memory. It needs
+	// an image, and it does not support checkpoint and restore.
+	RootfsUpperPath string
+
 	// ReadOnlyRoot mounts the root file system of the guest in read-only mode
 	// after the guest setup. /proc, /sys, /dev, /dev/shm, /dev/pts, and every
 	// mount of WorkspacePath and Mounts keep their own access flags.
@@ -259,6 +309,12 @@ type Config struct {
 
 	// Argv is the command vector passed to the guest process.
 	Argv []string
+
+	// Idle runs a built-in program that waits for a signal as the main guest
+	// process, in place of the command of the image. The root file system,
+	// the mounts, and Exec work as usual. An embedder uses it to read or
+	// write the files of a container that does not run.
+	Idle bool
 
 	// Entrypoint replaces the image Entrypoint when EntrypointSet is true. An
 	// empty Entrypoint with EntrypointSet clears the image Entrypoint. Docker
@@ -278,6 +334,18 @@ type Config struct {
 	// "uid:gid". The sandbox resolves names in the /etc/passwd and /etc/group
 	// of the guest. The empty string means the image User, and then root.
 	User string
+
+	// ExtraGroups adds supplementary groups to the user of every guest
+	// process, by name from the guest /etc/group or by number, as
+	// docker run --group-add does.
+	ExtraGroups []string
+
+	// Ulimits sets resource limits of every guest process, keyed by the
+	// lowercase Docker name without the RLIMIT_ prefix, such as "nofile".
+	Ulimits map[string]Ulimit
+
+	// ShmSizeBytes limits the tmpfs at /dev/shm. Zero keeps the default.
+	ShmSizeBytes int64
 
 	// Hostname is the hostname of the guest. The default is "gvx".
 	Hostname string
@@ -346,6 +414,15 @@ type Config struct {
 	// TTY allocates a pseudo-terminal line discipline for guest stdio (FD 0, 1, 2).
 	TTY bool
 
+	// TerminalLineDiscipline makes the guest terminal echo input and edit
+	// lines itself. Set it when Stdin carries raw input from a remote
+	// terminal, as from the Docker CLI. It needs TTY.
+	TerminalLineDiscipline bool
+
+	// TerminalRows and TerminalCols set the first size of the guest terminal
+	// when the host has no terminal. Zero selects 24 rows and 80 columns.
+	TerminalRows, TerminalCols uint16
+
 	// Architecture is the Linux guest architecture ("amd64" or "arm64").
 	// It selects the OCI manifest and the required ELF machine type. It
 	// defaults to runtime.GOARCH. The hardware backends run only the host
@@ -363,6 +440,12 @@ type Config struct {
 	// New and Restore also close it when they fail, so the caller never closes
 	// a listener after it passed it to them.
 	CheckpointListener net.Listener
+
+	// ControlListener is an optional pre-bound listener for an embedder control
+	// protocol, such as exec requests. New counts it as a pre-bound listener in
+	// the host lockdown profile and Close closes it. New also closes it when it
+	// fails. Use AcceptControlConn to accept connections after the lockdown.
+	ControlListener net.Listener
 
 	// DisableHostLockdown skips pkg/hostlockdown. New applies the lockdown
 	// (Windows RestrictedToken and JobObject, or macOS Seatbelt) by default,
@@ -483,6 +566,12 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	}
 	if c.AutoPublishPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: auto-publishing guest ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
+	}
+	if c.RootfsUpperPath != "" && c.OCIImage == "" && len(c.OCILayerTars) == 0 {
+		return fmt.Errorf("%w: RootfsUpperPath needs an image", ErrInvalidConfig)
+	}
+	if c.RootfsUpperPath != "" && (c.CheckpointDir != "" || c.CheckpointListener != nil) {
+		return fmt.Errorf("%w: RootfsUpperPath does not support checkpoint and restore", ErrInvalidConfig)
 	}
 	if err := c.validateMounts(); err != nil {
 		return err

@@ -19,12 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/fd"
 	"z.gfire.dev/gvx/pkg/gvx/hostcerts"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
@@ -39,6 +41,7 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform/hvf"
 	"z.gfire.dev/gvx/pkg/sentry/platform/whpx"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sentry/watchdog"
 	"z.gfire.dev/gvx/pkg/tcpip/stack"
 )
@@ -64,12 +67,17 @@ type Sandbox struct {
 	volumes           []*ext4lite.Volume
 	rootVolume        *ext4lite.Volume
 	rootUpperExisting bool
-	mounts            []sandboxMount
-	netStack          *stack.Stack
-	natForwarder      *netbackend.NATForwarder
-	portForwarder     *netbackend.PortForwarder
-	wgEndpoint        *netbackend.WireGuardEndpoint
-	wgPeerPort        uint16
+	rootUpper         *ext4lite.Volume
+	// upperRoot is the root of the upper layer of the guest root overlay
+	// while the guest runs. ArchiveUpper reads it.
+	upperRoot     vfs.VirtualDentry
+	upperRootCtx  gvcontext.Context
+	mounts        []sandboxMount
+	netStack      *stack.Stack
+	natForwarder  *netbackend.NATForwarder
+	portForwarder *netbackend.PortForwarder
+	wgEndpoint    *netbackend.WireGuardEndpoint
+	wgPeerPort    uint16
 	// guestResolvConf holds the guest /etc/resolv.conf text captured from the
 	// host resolver before hostlockdown.Apply runs.
 	guestResolvConf string
@@ -87,6 +95,12 @@ type Sandbox struct {
 	runDone           chan struct{}
 	runDoneOnce       sync.Once
 	activeKernel      *kernel.Kernel
+	activeThreadGroup *kernel.ThreadGroup
+	// execStdioMinor is the next free stdio device minor number of an exec
+	// process. The main process uses 0 to 2.
+	execStdioMinor uint32
+	// hostRAM is the memory of the host, read before the lockdown.
+	hostRAM           uint64
 	activeWatchdog    *watchdog.Watchdog
 	checkpointStopped atomic.Bool
 	restoredKernel    *kernel.Kernel
@@ -107,6 +121,13 @@ type Sandbox struct {
 func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
 	if ln := cfg.CheckpointListener; ln != nil {
+		defer func() {
+			if retErr != nil {
+				_ = ln.Close()
+			}
+		}()
+	}
+	if ln := cfg.ControlListener; ln != nil {
 		defer func() {
 			if retErr != nil {
 				_ = ln.Close()
@@ -144,11 +165,17 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	sb.platName = opened.name
 	sb.fallbackFrom = opened.fallbackFrom
 
+	if ram, err := hostMemoryBytes(); err == nil {
+		sb.hostRAM = ram
+	}
 	if err := sb.initOCILayers(ctx); err != nil {
 		return cleanup(err)
 	}
 
 	if err := sb.openMounts(); err != nil {
+		return cleanup(err)
+	}
+	if err := sb.openRootUpper(); err != nil {
 		return cleanup(err)
 	}
 
@@ -185,6 +212,9 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 
 	return sb, nil
 }
+
+// ErrNotRunning reports an operation that needs a running guest.
+var ErrNotRunning = errors.New("gvx: the guest is not running")
 
 // ErrPlatformUnavailable reports that the requested execution backend has no
 // implementation on the current host.
@@ -314,6 +344,9 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 		opts.DynamicListeners = s.cfg.Tuning.Int(tuning.ForwardMaxDynamicPorts)
 	}
 	if s.cfg.CheckpointListener != nil {
+		opts.PreboundListeners++
+	}
+	if s.cfg.ControlListener != nil {
 		opts.PreboundListeners++
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {
@@ -581,6 +614,12 @@ func (s *Sandbox) Close() error {
 			errs = append(errs, err)
 		}
 		s.cfg.CheckpointListener = nil
+	}
+	if s.cfg.ControlListener != nil {
+		if err := s.cfg.ControlListener.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+		s.cfg.ControlListener = nil
 	}
 
 	if s.portForwarder != nil {

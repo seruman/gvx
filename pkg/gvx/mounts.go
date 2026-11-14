@@ -116,6 +116,11 @@ type Mount struct {
 	// the Sentry tmpfs. A bind or volume mount must leave it zero.
 	TmpfsSizeBytes int64
 
+	// SeedFromImage copies the files that the root file system has at
+	// GuestPath into an empty writable mount before the guest starts, as a new
+	// Docker volume does. A mount that already has an entry stays as it is.
+	SeedFromImage bool
+
 	// CreateHostPathIfMissing creates the host directory of a bind mount when
 	// the path does not exist. New creates it before the host lockdown.
 	// Without it, a missing path is an error. It never creates a file, and it
@@ -1008,6 +1013,20 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	return nil
 }
 
+// openRootUpper opens the ext4lite image of Config.RootfsUpperPath before the
+// host lockdown.
+func (s *Sandbox) openRootUpper() error {
+	if s.cfg.RootfsUpperPath == "" {
+		return nil
+	}
+	vol, err := s.openVolumeImage(Mount{Kind: MountVolume, ImagePath: s.cfg.RootfsUpperPath, GuestPath: "/"}, s.cfg.RootfsUpperPath)
+	if err != nil {
+		return fmt.Errorf("gvx: open root upper layer: %w", err)
+	}
+	s.rootUpper = vol
+	return nil
+}
+
 // volumeImagePath returns the absolute host path of the image file of a
 // volume. Two mounts of one image get the same path, so openMounts can refuse
 // the second one.
@@ -1217,7 +1236,13 @@ func (s *Sandbox) closeMounts() error {
 		s.rootVolume = nil
 	}
 	s.workspaces = nil
+	if s.rootUpper != nil {
+		if err := s.rootUpper.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("gvx: close root upper layer: %w", err))
+		}
+	}
 	s.volumes = nil
+	s.rootUpper = nil
 	s.mounts = nil
 	s.workspace = nil
 	s.rootUpperExisting = false
