@@ -146,16 +146,20 @@ type createRequest struct {
 }
 
 type containerState struct {
-	Status        string                   `json:"Status"`
-	Running       bool                     `json:"Running"`
-	Pid           int                      `json:"Pid"`
-	ExitCode      int                      `json:"ExitCode"`
-	Error         string                   `json:"Error"`
-	StartedAt     time.Time                `json:"StartedAt"`
-	FinishedAt    time.Time                `json:"FinishedAt"`
-	Restarting    bool                     `json:"Restarting"`
-	Paused        bool                     `json:"Paused,omitempty"`
-	Stopping      bool                     `json:"Stopping,omitempty"`
+	Status     string    `json:"Status"`
+	Running    bool      `json:"Running"`
+	Pid        int       `json:"Pid"`
+	ExitCode   int       `json:"ExitCode"`
+	Error      string    `json:"Error"`
+	StartedAt  time.Time `json:"StartedAt"`
+	FinishedAt time.Time `json:"FinishedAt"`
+	Restarting bool      `json:"Restarting"`
+	Paused     bool      `json:"Paused,omitempty"`
+	Stopping   bool      `json:"Stopping,omitempty"`
+	// StopTimeout is the time in seconds that the supervisor waits after the
+	// stop signal before it kills the guest. The API process sets it with
+	// Stopping.
+	StopTimeout   *int                     `json:"StopTimeout,omitempty"`
 	SupervisorPid int                      `json:"SupervisorPid,omitempty"`
 	Ports         map[string][]portBinding `json:"Ports,omitempty"`
 	Health        *healthState             `json:"Health,omitempty"`

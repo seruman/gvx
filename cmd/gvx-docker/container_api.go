@@ -65,6 +65,7 @@ func (r processRuntime) start(_ context.Context, rec containerRecord) error {
 		// its values, and set only what the supervisor does not.
 		st.SupervisorPid = cmd.Process.Pid
 		st.Stopping = false
+		st.StopTimeout = nil
 		if !st.Running {
 			st.Status = "running"
 			st.Running = true
@@ -679,27 +680,51 @@ func (s *server) stopContainer(w http.ResponseWriter, r *http.Request, ref strin
 			timeout = time.Duration(n) * time.Second
 		}
 	}
-	if err := s.containers.updateState(rec.ID, func(st *containerState) { st.Stopping = true }); err != nil {
+	seconds := int(timeout / time.Second)
+	if err := s.containers.updateState(rec.ID, func(st *containerState) {
+		st.Stopping = true
+		st.StopTimeout = &seconds
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return false
 	}
-	// The supervisor forwards the stop signal of the container to the shim.
-	_ = signalProcess(rec.State.SupervisorPid, syscall.SIGTERM)
-	if !s.waitStopped(r.Context(), rec.ID, timeout) {
-		// SIGUSR2 makes the shim kill the guest with SIGKILL and then close
-		// the sandbox, so the volumes and the root image write their state.
-		// A SIGKILL of the shim process would lose it.
-		_ = signalProcess(rec.State.Pid, syscall.SIGUSR2)
-		if !s.waitStopped(r.Context(), rec.ID, 10*time.Second) {
-			_ = signalProcess(rec.State.Pid, syscall.SIGKILL)
-			_ = signalProcess(rec.State.SupervisorPid, syscall.SIGKILL)
-			s.waitStopped(r.Context(), rec.ID, 5*time.Second)
-		}
+	// The supervisor sends the stop signal of the container to its shim,
+	// waits for the timeout, and then kills the guest. It signals only its
+	// own child, which it has not reaped, so the PID cannot belong to another
+	// process. The API process signals only the PID that the supervisor lock
+	// names, and only while the lock is held.
+	s.signalSupervisor(rec.ID, syscall.SIGTERM)
+	if !s.waitStopped(r.Context(), rec.ID, timeout+shimKillGrace+s.stopGraceOrDefault()) {
+		// The supervisor did not end the run. Kill it as the last step; the
+		// shim sees the end of its supervisor pipe and kills the guest.
+		s.signalSupervisor(rec.ID, syscall.SIGKILL)
+		s.waitStopped(r.Context(), rec.ID, 5*time.Second)
 	}
 	if respond {
 		w.WriteHeader(http.StatusNoContent)
 	}
 	return true
+}
+
+// shimKillGrace is the time that a supervisor gives a shim to close its
+// sandbox after SIGUSR2, before it sends SIGKILL.
+const shimKillGrace = 10 * time.Second
+
+func (s *server) stopGraceOrDefault() time.Duration {
+	if s.stopGrace > 0 {
+		return s.stopGrace
+	}
+	return 5 * time.Second
+}
+
+// signalSupervisor sends sig to the live supervisor of container id. It
+// sends nothing when no supervisor holds the lock.
+func (s *server) signalSupervisor(id string, sig syscall.Signal) bool {
+	pid, ok := supervisorPID(s.containers.dir(id))
+	if !ok {
+		return false
+	}
+	return signalProcess(pid, sig) == nil
 }
 
 func (s *server) waitStopped(ctx context.Context, id string, timeout time.Duration) bool {
@@ -735,9 +760,11 @@ func (s *server) killContainer(w http.ResponseWriter, r *http.Request, ref strin
 		_ = s.containers.updateState(rec.ID, func(st *containerState) { st.Stopping = true })
 	}
 	if sig == linuxSIGKILL {
-		// See stopContainer: the shim turns SIGUSR2 into a SIGKILL of the
-		// guest and closes the sandbox cleanly.
-		err = signalProcess(rec.State.Pid, syscall.SIGUSR2)
+		// SIGUSR1 asks the supervisor to kill the guest at once. The shim
+		// closes the sandbox cleanly, so volumes keep their state.
+		if !s.signalSupervisor(rec.ID, syscall.SIGUSR1) {
+			err = fmt.Errorf("container %s has no live supervisor", rec.ID[:12])
+		}
 	} else {
 		err = s.signalGuest(r.Context(), rec.ID, sig)
 	}

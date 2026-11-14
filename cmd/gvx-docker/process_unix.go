@@ -17,12 +17,19 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
 )
 
+// signalProcess sends sig to the process pid. It refuses a PID that is not
+// positive, because kill(2) sends such a signal to a process group or to
+// every process of the user.
 func signalProcess(pid int, sig syscall.Signal) error {
+	if pid <= 0 {
+		return fmt.Errorf("refuse to signal PID %d", pid)
+	}
 	return syscall.Kill(pid, sig)
 }
 
