@@ -287,16 +287,37 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 			return nil
 		}
 		restarts++
-		select {
-		case <-ctx.Done():
+		if !waitRestartBackoff(ctx, store, rec.ID, backoff, sigs) {
 			return nil
-		case sig := <-sigs:
-			if sig == syscall.SIGTERM || sig == syscall.SIGUSR1 {
-				return nil
-			}
-		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, 10*time.Second)
+	}
+}
+
+// waitRestartBackoff waits before the next run of a restart policy. It
+// returns false when a stop or kill request, or the end of ctx, cancels the
+// restart.
+func waitRestartBackoff(ctx context.Context, store *containerStore, id string, backoff time.Duration, sigs <-chan os.Signal) bool {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+		case sig := <-sigs:
+			if sig != syscall.SIGTERM && sig != syscall.SIGUSR1 {
+				continue
+			}
+		case <-timer.C:
+			return true
+		}
+		// The run that ended is the last one. Record the exit, so the
+		// container does not stay "restarting" without a supervisor.
+		_ = store.updateState(id, func(st *containerState) {
+			st.Restarting = false
+			st.Running = false
+			st.Status = "exited"
+		})
+		return false
 	}
 }
 

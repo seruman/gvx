@@ -17,6 +17,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -162,5 +164,35 @@ func TestShimSeesSupervisorDeath(t *testing.T) {
 	case <-dead:
 	case <-time.After(5 * time.Second):
 		t.Fatal("watchSupervisor did not report the death of the supervisor")
+	}
+}
+
+// TestStopDuringRestartBackoffRecordsExit proves that a stop that arrives in
+// the wait between two runs leaves the container exited. A supervisor that
+// returned with the record at "restarting" left a container that inspect
+// showed as restarting forever.
+func TestStopDuringRestartBackoffRecordsExit(t *testing.T) {
+	dir := t.TempDir()
+	store := newContainerStore(dir)
+	id := strings.Repeat("e", 64)
+	rec := containerRecord{ID: id, Created: time.Now(), State: containerState{Restarting: true, Status: "restarting", ExitCode: 1}}
+	if err := store.create(rec); err != nil {
+		t.Fatal(err)
+	}
+	sigs := make(chan os.Signal, 1)
+	sigs <- syscall.SIGTERM
+	if waitRestartBackoff(context.Background(), store, id, time.Minute, sigs) {
+		t.Fatal("waitRestartBackoff = true after SIGTERM, want the restart cancelled")
+	}
+	raw, err := os.ReadFile(store.statePath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st containerState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Restarting || st.Running || st.Status != "exited" || st.ExitCode != 1 {
+		t.Fatalf("state after a stop in backoff = %+v, want exited with code 1", st)
 	}
 }
