@@ -56,7 +56,9 @@ A sandbox locks down its host process, so the process cannot start a second sand
 - It answers name lookups for the shim and opens connections to other containers.
 - It outlives the API process, so containers keep running when the API process exits.
 
-The shim opens its control socket before `hostlockdown.Apply()`. The API process sends `exec`, `resize`, and `dial` requests to that socket. The supervisor and the shim share one socket pair. The shim asks the supervisor for container names and for connections to other containers on that pair, because the lockdown blocks new Unix connections. The supervisor passes each new connection to the shim with `SCM_RIGHTS`.
+The shim opens its control socket before `hostlockdown.Apply()`. The API process sends `exec`, `resize`, and `dial` requests to that socket. The supervisor and the shim share one socket pair, because the lockdown blocks new Unix connections. The shim asks for container names on that pair. For each connection to another container, the shim first asks for a session: the supervisor creates a new socket pair, serves one end, and passes the other end with `SCM_RIGHTS`. The dial then runs on the session, so a target that does not answer delays no name lookup. The supervisor passes each new connection to the shim with `SCM_RIGHTS`. It reads the reply of the target shim one byte at a time, so the first bytes of a target that speaks first stay in the socket.
+
+The store chooses the address of a container on a network when it writes the record, under the lock that every process shares. Parallel creates, as Compose sends them, therefore get distinct addresses.
 
 ### 3.1 Liveness and Stop (Descriptive Module)
 
