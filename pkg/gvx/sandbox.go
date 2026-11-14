@@ -96,6 +96,12 @@ type Sandbox struct {
 	runDoneOnce       sync.Once
 	activeKernel      *kernel.Kernel
 	activeThreadGroup *kernel.ThreadGroup
+	// pauseMu serializes Pause and Resume. Kernel.Pause waits for every task
+	// goroutine, so it runs without mu.
+	pauseMu sync.Mutex
+	// userPaused reports a Pause without its Resume.
+	// +checklocks:pauseMu
+	userPaused bool
 	// execStdioMinor is the next free stdio device minor number of an exec
 	// process. The main process uses 0 to 2.
 	execStdioMinor uint32

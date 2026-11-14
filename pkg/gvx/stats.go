@@ -15,6 +15,7 @@
 package gvx
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -24,27 +25,45 @@ import (
 )
 
 // Pause stops every task of the guest until Resume. A paused guest runs no
-// code, as the freezer of a Docker container.
+// code, as the freezer of a Docker container. A Pause of a paused guest does
+// nothing, so one Resume ends any number of Pause calls.
 func (s *Sandbox) Pause() error {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
 	s.mu.Lock()
 	k := s.activeKernel
 	s.mu.Unlock()
 	if k == nil {
 		return ErrNotRunning
 	}
+	if s.userPaused {
+		return nil
+	}
 	k.Pause()
+	s.userPaused = true
 	return nil
 }
 
-// Resume ends the effect of a Pause.
+// ErrNotPaused reports a Resume of a guest that Pause did not stop.
+var ErrNotPaused = errors.New("gvx: the guest is not paused")
+
+// Resume ends the effect of a Pause. It returns ErrNotPaused when Pause did
+// not stop the guest: an unmatched unpause makes the kernel panic, which
+// would end the host process.
 func (s *Sandbox) Resume() error {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
 	s.mu.Lock()
 	k := s.activeKernel
 	s.mu.Unlock()
 	if k == nil {
 		return ErrNotRunning
 	}
+	if !s.userPaused {
+		return ErrNotPaused
+	}
 	k.Unpause()
+	s.userPaused = false
 	return nil
 }
 
