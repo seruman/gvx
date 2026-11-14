@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/gvx"
@@ -335,6 +336,13 @@ type netResponse struct {
 // The shim sends one JSON request per line and reads one JSON response per
 // line, in order. A "dial" response passes a connected socket to the target
 // guest with SCM_RIGHTS.
+//
+// A dial can wait for seconds on a target that does not answer, and the
+// requests on one connection run in order. The shim therefore sends name
+// lookups on the shared connection and asks for a "session" for each dial:
+// the supervisor creates a new socket pair, serves one end like the shared
+// connection, and passes the other end with SCM_RIGHTS. No request on the
+// shared connection waits for a dial.
 
 func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, store *containerStore, id string) {
 	go func() {
@@ -405,6 +413,14 @@ func answerNetwork(ctx context.Context, stateDir string, store *containerStore, 
 			return netResponse{Found: true, Error: err.Error()}, nil
 		}
 		return netResponse{Found: true}, f
+	case "session":
+		conn, child, err := socketPair()
+		if err != nil {
+			return netResponse{Error: err.Error()}, nil
+		}
+		syscall.CloseOnExec(int(child.Fd()))
+		go serveNetworkConn(ctx, conn, stateDir, store, id)
+		return netResponse{Found: true}, child
 	case "dial":
 		target, ok := routeAddress(self, all, req.Addr)
 		if !ok {
@@ -465,9 +481,37 @@ func (c *netClient) call(req netRequest) (netResponse, *os.File, error) {
 	return resp, parseRights(oob[:oobn]), nil
 }
 
+// session opens a supervisor connection of its own for one request that can
+// take long, so the shared connection stays free for name lookups.
+func (c *netClient) session() (*netClient, error) {
+	resp, file, err := c.call(netRequest{Op: "session"})
+	if err != nil {
+		return nil, err
+	}
+	if file == nil {
+		return nil, fmt.Errorf("open a supervisor session: %s", resp.Error)
+	}
+	conn, err := fileUnixConn(file)
+	_ = file.Close()
+	if err != nil {
+		return nil, err
+	}
+	return &netClient{conn: conn}, nil
+}
+
+// callInSession sends one request on a new session and closes the session.
+func (c *netClient) callInSession(req netRequest) (netResponse, *os.File, error) {
+	s, err := c.session()
+	if err != nil {
+		return netResponse{}, nil, err
+	}
+	defer func() { _ = s.conn.Close() }()
+	return s.call(req)
+}
+
 // dialUnix asks the supervisor for a connection to a host Unix socket.
 func (c *netClient) dialUnix(path string) (net.Conn, error) {
-	resp, file, err := c.call(netRequest{Op: "unix", Addr: path})
+	resp, file, err := c.callInSession(netRequest{Op: "unix", Addr: path})
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +568,7 @@ func shimNetworkHooks(client *netClient, rec containerRecord, internal bool) (fu
 		if src, ok := gvx.NATGuestSource(ctx); ok {
 			req.SrcPort = src.Port()
 		}
-		resp, file, err := client.call(req)
+		resp, file, err := client.callInSession(req)
 		if err != nil {
 			return nil, true, err
 		}
