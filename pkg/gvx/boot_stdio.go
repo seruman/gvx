@@ -520,7 +520,12 @@ func isHostTerminalReader(r io.Reader) bool {
 	return isHostTerminal(r)
 }
 
-func (f *stdioFD) Release(gvcontext.Context) {}
+// Release implements vfs.FileDescriptionImpl.Release.
+func (f *stdioFD) Release(gvcontext.Context) {
+	if f.dev != nil {
+		f.dev.opens.Add(-1)
+	}
+}
 
 func (f *stdioFD) EventRegister(e *waiter.Entry) error {
 	if f.tty != nil {

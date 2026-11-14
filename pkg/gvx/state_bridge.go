@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -251,6 +252,12 @@ type stdioDevice struct {
 	tty          *ttyState   `state:"wait"`
 	pump         *stdinPump  `state:"wait"`
 	mu           *sync.Mutex `state:"nosave"`
+	// devMu orders Open against the retire and the reuse of the device by
+	// exec processes.
+	devMu sync.Mutex `state:"nosave"`
+	// opens counts the open file descriptions of the device. An exec reuses
+	// a device only when the count is zero.
+	opens atomic.Int32 `state:"nosave"`
 }
 
 var _ vfs.Device = (*stdioDevice)(nil)

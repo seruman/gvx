@@ -85,11 +85,6 @@ func (s *Sandbox) Exec(ctx context.Context, cfg ExecConfig) (*ExecProcess, error
 	}
 	s.mu.Lock()
 	k, mainTG := s.activeKernel, s.activeThreadGroup
-	if s.execStdioMinor < 3 {
-		s.execStdioMinor = 3
-	}
-	firstMinor := s.execStdioMinor
-	s.execStdioMinor += 3
 	s.mu.Unlock()
 	if k == nil || mainTG == nil {
 		return nil, ErrNotRunning
@@ -149,13 +144,14 @@ func (s *Sandbox) Exec(ctx context.Context, cfg ExecConfig) (*ExecProcess, error
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	stdio, err := openStdioFDsAt(sctx, vfsObj, rootCreds, firstMinor, cfg.Stdin, stdout, stderr, tty, pump)
+	stdio, releaseStdio, err := s.openExecStdio(sctx, vfsObj, rootCreds, cfg.Stdin, stdout, stderr, tty, pump)
 	if err != nil {
 		fdTable.DecRef(sctx)
 		mntns.DecRef(sctx)
 		runCleanup()
 		return nil, err
 	}
+	cleanups = append(cleanups, releaseStdio)
 	_, fdErr := fdTable.NewFDs(sctx, 0, stdio[:], kernel.FDFlags{})
 	for _, fd := range stdio {
 		fd.DecRef(sctx)
