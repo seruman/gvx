@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -244,11 +245,15 @@ func (s *Sandbox) openManifestLayers(digests []string) (err error) {
 // opens all host handles, validates manifest.json, and applies hostlockdown
 // before loading untrusted checkpoint pages and kernel state.
 //
-// Restore takes ownership of Config.CheckpointListener on every call. When
-// Restore fails, it closes the listener.
+// Restore takes ownership of Config.CheckpointListener and
+// Config.ControlListener on every call, as New does. When Restore fails, it
+// closes them.
 func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
-	if ln := cfg.CheckpointListener; ln != nil {
+	for _, ln := range []net.Listener{cfg.CheckpointListener, cfg.ControlListener} {
+		if ln == nil {
+			continue
+		}
 		defer func() {
 			if retErr != nil {
 				_ = ln.Close()
@@ -257,6 +262,11 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	}
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
+	}
+	if cfg.RootfsUpperPath != "" {
+		// A restored guest takes its root file system from the checkpoint,
+		// so it cannot use a persistent upper layer.
+		return nil, fmt.Errorf("%w: Restore does not support RootfsUpperPath", ErrInvalidConfig)
 	}
 	manifest, err := readAndParseManifest(opts.Dir)
 	if err != nil {
