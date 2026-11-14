@@ -196,3 +196,56 @@ func TestStopDuringRestartBackoffRecordsExit(t *testing.T) {
 		t.Fatalf("state after a stop in backoff = %+v, want exited with code 1", st)
 	}
 }
+
+// TestSuperviseShimEscalatesWhenCtxAndSignalBothFire drives the real
+// supervisor loop with one SIGTERM that ends ctx and also arrives on the
+// signal channel, as in a supervisor. The shim ignores the stop signal. The
+// loop must still send SIGUSR2 after the timeout.
+func TestSuperviseShimEscalatesWhenCtxAndSignalBothFire(t *testing.T) {
+	for _, order := range []string{"signal first", "ctx first"} {
+		t.Run(order, func(t *testing.T) {
+			shim := exec.Command("/bin/sleep", "60")
+			if err := shim.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- shim.Wait() }()
+			defer func() { _ = shim.Process.Kill() }()
+
+			const timeout = 200 * time.Millisecond
+			stop := &shimStopper{
+				shim:        shim.Process,
+				signalGuest: func(int) error { return nil },
+				settings:    func() (int, time.Duration) { return linuxSIGTERM, timeout },
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			sigs := make(chan os.Signal, 2)
+			if order == "ctx first" {
+				cancel()
+				time.AfterFunc(20*time.Millisecond, func() { sigs <- syscall.SIGTERM })
+			} else {
+				sigs <- syscall.SIGTERM
+				time.AfterFunc(20*time.Millisecond, cancel)
+			}
+			defer cancel()
+
+			result := make(chan int, 1)
+			start := time.Now()
+			go func() {
+				code, _ := superviseShim(ctx, shim.Process, sigs, stop, done)
+				result <- code
+			}()
+			select {
+			case code := <-result:
+				if code != 128+int(syscall.SIGUSR2) {
+					t.Fatalf("shim exit code = %d, want %d (SIGUSR2)", code, 128+int(syscall.SIGUSR2))
+				}
+				if took := time.Since(start); took > timeout+2*time.Second {
+					t.Fatalf("the escalation took %v, want about %v", took, timeout)
+				}
+			case <-time.After(timeout + 3*time.Second):
+				t.Fatal("the supervisor never sent SIGUSR2 to a shim that ignores the stop signal")
+			}
+		})
+	}
+}
