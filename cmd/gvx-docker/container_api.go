@@ -71,11 +71,14 @@ func (r processRuntime) start(_ context.Context, rec containerRecord) error {
 			st.StartedAt = time.Now().UTC()
 		}
 	})
+	// Reap the supervisor when it exits. Setsid does not change its parent,
+	// so without Wait it stays a zombie for the life of this process.
+	go func() { _ = cmd.Wait() }()
 	if err != nil {
 		_ = cmd.Process.Kill()
 		return err
 	}
-	return cmd.Process.Release()
+	return nil
 }
 
 func (s *server) routeContainer(w http.ResponseWriter, r *http.Request, path string) bool {
