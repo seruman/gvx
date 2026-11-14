@@ -17,19 +17,10 @@
 package main
 
 import (
-	"errors"
 	"os"
 	"os/exec"
 	"syscall"
 )
-
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
 
 func signalProcess(pid int, sig syscall.Signal) error {
 	return syscall.Kill(pid, sig)

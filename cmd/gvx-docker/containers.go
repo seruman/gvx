@@ -292,6 +292,17 @@ func (s *containerStore) lockAll() (func(), error) {
 	}, nil
 }
 
+// claimSupervisor takes the supervisor lock of container id under the store
+// lock, so that two supervisors of one container cannot start together.
+func (s *containerStore) claimSupervisor(id string) (supervisorLock, error) {
+	unlock, err := s.lockAll()
+	if err != nil {
+		return supervisorLock{}, err
+	}
+	defer unlock()
+	return acquireSupervisorLock(s.dir(id))
+}
+
 // update reads the record of id, applies fn, and writes the record and the
 // state back, under the lock of every process.
 func (s *containerStore) update(id string, fn func(*containerRecord) error) (containerRecord, error) {
@@ -388,7 +399,7 @@ func (s *containerStore) readLocked(id string) (containerRecord, error) {
 	if err := readJSONFile(s.statePath(id), &rec.State); err != nil {
 		return containerRecord{}, err
 	}
-	refreshProcessState(&rec.State)
+	refreshProcessStateIn(s.dir(id), &rec.State)
 	return rec, nil
 }
 
@@ -402,22 +413,6 @@ func (s *containerStore) remove(id string) error {
 		return fmt.Errorf("remove container %s: %w", id, err)
 	}
 	return nil
-}
-
-func refreshProcessState(state *containerState) {
-	if (state.Running || state.Restarting) && !processAlive(state.Pid) && !processAlive(state.SupervisorPid) {
-		state.Paused = false
-		state.Running = false
-		state.Restarting = false
-		state.Status = "exited"
-		state.Pid = 0
-		if state.FinishedAt.IsZero() {
-			state.FinishedAt = time.Now().UTC()
-		}
-		if state.ExitCode == 0 {
-			state.ExitCode = 137
-		}
-	}
 }
 
 func writeJSONFile(path string, value any) error {
