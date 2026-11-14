@@ -227,6 +227,13 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 	if err != nil {
 		return err
 	}
+	// The lock marks this supervisor as alive for the API process and for
+	// every later supervisor. The kernel drops it when this process dies.
+	lock, err := store.claimSupervisor(rec.ID)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
 	logFile, err := openRotatingLog(store.logPath(rec.ID), rec.HostConfig.LogConfig)
 	if err != nil {
 		return fmt.Errorf("open log: %w", err)
