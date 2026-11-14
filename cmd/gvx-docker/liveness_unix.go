@@ -95,7 +95,10 @@ func supervisorAlive(dir string) bool {
 }
 
 // supervisorPID returns the PID of the supervisor that holds the lock of the
-// container directory dir. It probes with a non-blocking shared lock, which
+// container directory dir. A probe without the store lock can open the old
+// file just before a claim renames the new one over it, and read "dead" for
+// that moment. A claim happens only when no supervisor lives, so the result
+// is correct in effect. It probes with a non-blocking shared lock, which
 // fails only while the holder lives, and reads the PID from the same file.
 func supervisorPID(dir string) (int, bool) {
 	f, err := os.OpenFile(filepath.Join(dir, supervisorLockName), os.O_RDONLY|syscall.O_CLOEXEC, 0)

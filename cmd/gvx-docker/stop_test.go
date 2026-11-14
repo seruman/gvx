@@ -249,3 +249,37 @@ func TestSuperviseShimEscalatesWhenCtxAndSignalBothFire(t *testing.T) {
 		})
 	}
 }
+
+// TestSupervisorDeathKillsGuestWithoutHostSignal proves that the shim reacts
+// to the death of its supervisor through the sandbox alone. The Linux seccomp
+// filter of a locked-down shim denies kill(2), so a handler that signals the
+// shim process would end it with SIGSYS instead of a clean close.
+func TestSupervisorDeathKillsGuestWithoutHostSignal(t *testing.T) {
+	hostSignals := make(chan os.Signal, 4)
+	signal.Notify(hostSignals, syscall.SIGUSR2)
+	defer signal.Stop(hostSignals)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guest []int
+	finished := make(chan struct{})
+	go func() {
+		watchSupervisor(r, supervisorDeathHandler(func(n int) error {
+			guest = append(guest, n)
+			return nil
+		}))
+		close(finished)
+	}()
+	_ = w.Close()
+	<-finished
+	if len(guest) != 1 || guest[0] != linuxSIGKILL {
+		t.Fatalf("guest signals = %v, want one SIGKILL (%d)", guest, linuxSIGKILL)
+	}
+	select {
+	case sig := <-hostSignals:
+		t.Fatalf("the handler sent the host signal %v to the shim process", sig)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
