@@ -314,6 +314,11 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	sctx := k.SupervisorContext()
 	mntns, err := s.buildKernelRootMountNamespace(sctx, k, creds)
+	// The root mount sets upperRoot. A run that fails before the guest ends
+	// must drop that reference too, before the kernel and the mounts go;
+	// executeActiveKernel drops it at the normal end. setRootUpperDentry
+	// ignores an empty dentry, so the second call does nothing.
+	defer s.setRootUpperDentry(sctx, vfs.VirtualDentry{})
 	if err != nil {
 		return 1, err
 	}

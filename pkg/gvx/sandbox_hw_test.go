@@ -955,3 +955,39 @@ func TestSandboxRepeatedExecsReuseStdioDevices(t *testing.T) {
 	}
 	_ = sb.Signal(int(syscall.SIGKILL))
 }
+
+// TestSandboxFailedRunReleasesTheRootUpperLayer runs a guest whose command
+// does not exist, with a root upper image. The run fails before the guest
+// starts. The sandbox must drop its reference on the upper layer then: the
+// close of the sandbox closes the ext4lite image under it.
+func TestSandboxFailedRunReleasesTheRootUpperLayer(t *testing.T) {
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hostTestConfig(t)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.RootfsUpperPath = filepath.Join(t.TempDir(), "rootfs.ext4")
+	cfg.Argv = []string{"/bin/missing"}
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	if _, err := sb.Run(context.Background()); !errors.Is(err, ErrExecutableNotFound) {
+		t.Fatalf("Run() = %v, want ErrExecutableNotFound", err)
+	}
+	sb.mu.Lock()
+	held := sb.upperRoot.Ok()
+	sb.mu.Unlock()
+	if held {
+		t.Fatal("the sandbox keeps a reference on the root upper layer after a failed run")
+	}
+	if err := sb.ArchiveUpper(io.Discard); !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("ArchiveUpper after a failed run = %v, want ErrNotRunning", err)
+	}
+}

@@ -409,12 +409,15 @@ func (s *Sandbox) ArchiveUpper(w io.Writer) error {
 	if upper.Ok() {
 		upper.IncRef()
 	}
+	ctx := s.upperRootCtx
 	s.mu.Unlock()
 	if !upper.Ok() {
 		return ErrNotRunning
 	}
+	// Drop the reference on every path. withGuestFS can return
+	// ErrNotRunning without the callback, before the guest starts.
+	defer upper.DecRef(ctx)
 	return s.withGuestFS(func(g guestFS) error {
-		defer upper.DecRef(g.ctx)
 		ug := guestFS{ctx: g.ctx, vfs: g.vfs, creds: g.creds, root: upper}
 		tw := tar.NewWriter(w)
 		if err := ug.archiveUpperDir(tw, "/", ""); err != nil {
