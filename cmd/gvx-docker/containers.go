@@ -235,6 +235,9 @@ func (s *containerStore) create(rec containerRecord) error {
 			return fmt.Errorf("%w: container name %q is already in use", errConflict, rec.Name)
 		}
 	}
+	if err := s.assignAddressesLocked(&rec); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(s.dir(rec.ID), 0o700); err != nil {
 		return fmt.Errorf("create container directory: %w", err)
 	}
@@ -300,6 +303,37 @@ func (s *containerStore) lockAll() (func(), error) {
 	}, nil
 }
 
+// assignAddressesLocked gives each endpoint of rec without an address the
+// first free address of its network. The caller holds the store lock, so the
+// choice and the write of the record are one step for every process.
+func (s *containerStore) assignAddressesLocked(rec *containerRecord) error {
+	var others []containerRecord
+	for name, ep := range rec.Networks {
+		if ep.IPAddress != "" {
+			continue
+		}
+		if others == nil {
+			all, err := s.listLocked()
+			if err != nil {
+				return err
+			}
+			others = make([]containerRecord, 0, len(all))
+			for _, c := range all {
+				if c.ID != rec.ID {
+					others = append(others, c)
+				}
+			}
+		}
+		ip, err := allocateIP(networkRecord{Name: name, Subnet: ep.Subnet, Gateway: ep.Gateway}, others)
+		if err != nil {
+			return err
+		}
+		ep.IPAddress = ip
+		rec.Networks[name] = ep
+	}
+	return nil
+}
+
 // claimSupervisor takes the supervisor lock of container id under the store
 // lock, so that two supervisors of one container cannot start together.
 func (s *containerStore) claimSupervisor(id string) (supervisorLock, error) {
@@ -324,6 +358,9 @@ func (s *containerStore) update(id string, fn func(*containerRecord) error) (con
 		return containerRecord{}, fmt.Errorf("%w: No such container: %s", errNotFound, id)
 	}
 	if err := fn(&rec); err != nil {
+		return rec, err
+	}
+	if err := s.assignAddressesLocked(&rec); err != nil {
 		return rec, err
 	}
 	if err := writeJSONFile(s.configPath(rec.ID), rec); err != nil {

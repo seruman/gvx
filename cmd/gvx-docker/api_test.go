@@ -127,6 +127,14 @@ func TestDefaultNetworkModeAttachesBridge(t *testing.T) {
 	if err := s.containerNetworks(&rec, "default", cfg); err != nil {
 		t.Fatalf("containerNetworks: %v", err)
 	}
+	// The store assigns the address when it writes the record.
+	if err := s.containers.create(rec); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.containers.get(rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ep, ok := rec.Networks[defaultNetworkName]; !ok || ep.IPAddress != "172.17.0.2" {
 		t.Fatalf("networks = %+v, want bridge at 172.17.0.2", rec.Networks)
 	}
