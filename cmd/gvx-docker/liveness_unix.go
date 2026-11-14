@@ -145,3 +145,23 @@ func refreshProcessStateIn(dir string, state *containerState) {
 		state.ExitCode = 137
 	}
 }
+
+// lockStateDir takes the lock that one serve process holds on its state
+// directory for its whole life. It fails when another serve holds it.
+func lockStateDir(dir string) (supervisorLock, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return supervisorLock{}, fmt.Errorf("create state directory: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "serve.lock"), os.O_CREATE|os.O_RDWR|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return supervisorLock{}, fmt.Errorf("open serve lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return supervisorLock{}, fmt.Errorf("another gvx-docker serve uses %s", dir)
+		}
+		return supervisorLock{}, fmt.Errorf("lock state directory: %w", err)
+	}
+	return supervisorLock{f: f}, nil
+}
