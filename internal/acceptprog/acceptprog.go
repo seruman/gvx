@@ -56,6 +56,7 @@ const (
 	volTreePackage     = "z.gfire.dev/gvx/internal/acceptprog/voltree"
 	fsFeaturesPackage  = "z.gfire.dev/gvx/internal/acceptprog/fsfeatures"
 	unixDialPackage    = "z.gfire.dev/gvx/internal/acceptprog/unixdial"
+	churnPackage       = "z.gfire.dev/gvx/internal/acceptprog/churn"
 	compatProbePackage = "z.gfire.dev/gvx/internal/acceptprog/compatprobe"
 	microBenchPackage  = "z.gfire.dev/gvx/internal/acceptprog/microbench"
 	parityProbePackage = "z.gfire.dev/gvx/internal/acceptprog/parityprobe"
@@ -208,6 +209,14 @@ func BuildVolumeTree(tb testing.TB, goarch string) string {
 func BuildUnixDial(tb testing.TB, goarch string) string {
 	tb.Helper()
 	return buildStaticGuest(tb, unixDialPackage, "unixdial", goarch, 0)
+}
+
+// BuildChurn compiles the guest program churn for the Linux architecture
+// goarch and returns the path of the executable. The program starts short
+// child processes of itself in a loop.
+func BuildChurn(tb testing.TB, goarch string) string {
+	tb.Helper()
+	return buildStaticGuest(tb, churnPackage, "churn", goarch, 0)
 }
 
 // BuildFSFeatures compiles the guest program fsfeatures for the Linux
