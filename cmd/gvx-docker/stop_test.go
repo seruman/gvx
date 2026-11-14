@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -281,5 +282,43 @@ func TestSupervisorDeathKillsGuestWithoutHostSignal(t *testing.T) {
 	case sig := <-hostSignals:
 		t.Fatalf("the handler sent the host signal %v to the shim process", sig)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestSuperviseHonorsAStopThatCameBeforeItsLock proves that a supervisor does
+// not start a run when a stop arrived while the start was pending. The stop
+// found no lock and sent no signal, so the supervisor must read the request
+// from the record.
+func TestSuperviseHonorsAStopThatCameBeforeItsLock(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "shim-ran")
+	exe := filepath.Join(dir, "fake-gvx-docker")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\ntouch "+marker+"\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := paths{stateDir: filepath.Join(dir, "state")}
+	p.normalize()
+	store := newContainerStore(p.stateDir)
+	id := strings.Repeat("9", 64)
+	st := containerState{Running: true, Status: "running", StartPending: time.Now().UTC(), Stopping: true}
+	if err := store.create(containerRecord{ID: id, Created: time.Now(), State: st}); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervise(context.Background(), exe, p, store, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the supervisor started a shim after a stop that came before its lock")
+	}
+	raw, err := os.ReadFile(store.statePath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got containerState
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Running || got.Status != "exited" || !got.StartPending.IsZero() {
+		t.Fatalf("state = running %v status %q pending %v, want exited without a pending start", got.Running, got.Status, got.StartPending)
 	}
 }
