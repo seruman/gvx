@@ -218,13 +218,18 @@ func embedderRules(cfg Config, hostDirs, volumes bool) seccomp.SyscallRules {
 			seccomp.EqualTo(unix.LOCK_UN),
 		})
 	}
-	if cfg.CheckpointListener != nil {
-		// AcceptCheckpointConn accepts a connection on the pre-bound
-		// CheckpointListener socket. A TCP listener configures keepalive
-		// and TCP_NODELAY on the accepted connection.
+	if cfg.CheckpointListener != nil || cfg.ControlListener != nil {
+		// AcceptCheckpointConn and AcceptControlConn accept a connection on
+		// a pre-bound listener. Go reads the addresses of the new
+		// connection with getsockname and getpeername. Without a network
+		// backend, no hostinet rule allows these calls.
 		rules.Add(unix.SYS_ACCEPT4, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETSOCKNAME, seccomp.MatchAll{})
 		rules.Add(unix.SYS_GETPEERNAME, seccomp.MatchAll{})
+	}
+	if cfg.CheckpointListener != nil {
+		// A TCP checkpoint listener configures keepalive and TCP_NODELAY on
+		// the accepted connection.
 		rules.Add(unix.SYS_SETSOCKOPT, seccomp.Or{
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
