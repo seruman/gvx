@@ -241,10 +241,13 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 	if err := store.updateState(rec.ID, func(st *containerState) {
 		st.StartPending = time.Time{}
 		if st.Stopping {
+			// Docker records 137 for a container that a stop ended without
+			// a clean exit; no run took place to give another code.
 			stopped = true
 			st.Running = false
 			st.Restarting = false
 			st.Status = "exited"
+			st.ExitCode = 137
 			st.FinishedAt = time.Now().UTC()
 		}
 	}); err != nil {
@@ -639,14 +642,14 @@ func runShim(ctx context.Context, p paths, store *containerStore, id string, opt
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGUSR2, syscall.SIGWINCH, syscall.SIGCONT)
 	defer signal.Stop(sigs)
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if opts.lifeFD >= 0 {
 		// The end of the supervisor pipe takes the path of SIGUSR2 in this
 		// process. A kill(2) of the shim itself would need a host call that
 		// the Linux seccomp filter denies after the lockdown.
-		go watchSupervisor(os.NewFile(uintptr(opts.lifeFD), "gvx-docker-life"), supervisorDeathHandler(sb.Signal))
+		go watchSupervisor(os.NewFile(uintptr(opts.lifeFD), "gvx-docker-life"), supervisorDeathHandler(sb.Signal, cancel))
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	go func() {
 		for {
 			select {
@@ -677,9 +680,14 @@ func guestSignalFor(s syscall.Signal, signal func(int) error) error {
 }
 
 // supervisorDeathHandler returns the action of a shim whose supervisor died:
-// a SIGKILL of the guest through the sandbox, the path of SIGUSR2.
-func supervisorDeathHandler(signal func(int) error) func() {
-	return func() { _ = guestSignalFor(syscall.SIGUSR2, signal) }
+// a SIGKILL of the guest through the sandbox, the path of SIGUSR2. The
+// signal fails when no guest runs yet, so the handler also ends the run
+// context: Run then kills the guest as soon as it starts.
+func supervisorDeathHandler(signal func(int) error, endRun context.CancelFunc) func() {
+	return func() {
+		_ = guestSignalFor(syscall.SIGUSR2, signal)
+		endRun()
+	}
 }
 
 // watchSupervisor calls dead when the supervisor pipe ends. The supervisor

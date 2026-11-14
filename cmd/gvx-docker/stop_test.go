@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -270,7 +271,7 @@ func TestSupervisorDeathKillsGuestWithoutHostSignal(t *testing.T) {
 		watchSupervisor(r, supervisorDeathHandler(func(n int) error {
 			guest = append(guest, n)
 			return nil
-		}))
+		}, func() {}))
 		close(finished)
 	}()
 	_ = w.Close()
@@ -318,7 +319,22 @@ func TestSuperviseHonorsAStopThatCameBeforeItsLock(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Running || got.Status != "exited" || !got.StartPending.IsZero() {
-		t.Fatalf("state = running %v status %q pending %v, want exited without a pending start", got.Running, got.Status, got.StartPending)
+	if got.Running || got.Status != "exited" || !got.StartPending.IsZero() || got.ExitCode != 137 {
+		t.Fatalf("state = running %v status %q exit %d pending %v, want exited 137 without a pending start", got.Running, got.Status, got.ExitCode, got.StartPending)
+	}
+}
+
+// TestSupervisorDeathBeforeGuestStartEndsTheRun proves that a shim whose
+// supervisor dies before its guest starts still ends. The guest signal fails
+// with no kernel, so the handler must also end the run context.
+func TestSupervisorDeathBeforeGuestStartEndsTheRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler := supervisorDeathHandler(func(int) error { return errors.New("gvx: the guest is not running") }, cancel)
+	handler()
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("the run context stays open after the supervisor died before the guest started")
 	}
 }
