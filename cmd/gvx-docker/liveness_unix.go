@@ -35,6 +35,11 @@ import (
 // answer kill(pid, 0).
 const supervisorLockName = "supervisor.lock"
 
+// supervisorStartWindow is the time that a started supervisor has to take
+// its lock. A container whose supervisor has no lock after it reads as
+// exited.
+const supervisorStartWindow = 30 * time.Second
+
 // supervisorLock is the held lock of one supervisor.
 type supervisorLock struct{ f *os.File }
 
@@ -120,6 +125,11 @@ func supervisorPID(dir string) (int, bool) {
 // runs a container, so the lock is the one source of truth for "alive".
 func refreshProcessStateIn(dir string, state *containerState) {
 	if !(state.Running || state.Restarting) || supervisorAlive(dir) {
+		return
+	}
+	if !state.StartPending.IsZero() && time.Since(state.StartPending) < supervisorStartWindow {
+		// The API process started a supervisor that has not taken its lock
+		// yet.
 		return
 	}
 	state.Paused = false

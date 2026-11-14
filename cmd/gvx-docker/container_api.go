@@ -49,35 +49,56 @@ type processRuntime struct {
 	exe   string
 	paths paths
 	store *containerStore
+	// afterSupervisorStart runs between the start of the supervisor and the
+	// state update of start. Tests use it to order the two writers.
+	afterSupervisorStart func()
 }
 
 func (r processRuntime) start(_ context.Context, rec containerRecord) error {
+	// Mark the start before the supervisor exists. Only the supervisor
+	// writes "running" and the exit, so a run that ends at once keeps its
+	// exit. The flags make the container read as running until the
+	// supervisor writes its first state, so stop and wait see it.
+	if err := r.store.updateState(rec.ID, func(st *containerState) {
+		st.Running = true
+		st.Status = "running"
+		st.Pid = 0
+		st.ExitCode = 0
+		st.Error = ""
+		st.Stopping = false
+		st.StopTimeout = nil
+		st.StartedAt = time.Now().UTC()
+		st.FinishedAt = time.Time{}
+		st.StartPending = time.Now().UTC()
+	}); err != nil {
+		return err
+	}
 	cmd := exec.Command(r.exe, "supervise", "-state-dir", r.paths.stateDir, rec.ID)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
+		_ = r.store.updateState(rec.ID, func(st *containerState) {
+			st.Running = false
+			st.StartPending = time.Time{}
+			st.Status = "exited"
+			st.ExitCode = 125
+			st.Error = err.Error()
+			st.FinishedAt = time.Now().UTC()
+		})
 		return fmt.Errorf("start supervisor: %w", err)
 	}
-	err := r.store.updateState(rec.ID, func(st *containerState) {
-		// The supervisor can record its shim before this update runs. Keep
-		// its values, and set only what the supervisor does not.
-		st.SupervisorPid = cmd.Process.Pid
-		st.Stopping = false
-		st.StopTimeout = nil
-		if !st.Running {
-			st.Status = "running"
-			st.Running = true
-			st.StartedAt = time.Now().UTC()
-		}
-	})
 	// Reap the supervisor when it exits. Setsid does not change its parent,
 	// so without Wait it stays a zombie for the life of this process.
-	go func() { _ = cmd.Wait() }()
-	if err != nil {
-		_ = cmd.Process.Kill()
-		return err
+	go func() {
+		_ = cmd.Wait()
+		// A supervisor that died before it took its lock leaves the start
+		// pending. End it, so the container reads as exited at once.
+		_ = r.store.updateState(rec.ID, func(st *containerState) { st.StartPending = time.Time{} })
+	}()
+	if r.afterSupervisorStart != nil {
+		r.afterSupervisorStart()
 	}
 	return nil
 }
