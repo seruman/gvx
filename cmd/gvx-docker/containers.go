@@ -159,7 +159,11 @@ type containerState struct {
 	// StopTimeout is the time in seconds that the supervisor waits after the
 	// stop signal before it kills the guest. The API process sets it with
 	// Stopping.
-	StopTimeout   *int                     `json:"StopTimeout,omitempty"`
+	StopTimeout *int `json:"StopTimeout,omitempty"`
+	// StartPending is the time at which the API process started a
+	// supervisor that has not taken its lock yet. The container reads as
+	// running in that window.
+	StartPending  time.Time                `json:"StartPending,omitempty"`
 	SupervisorPid int                      `json:"SupervisorPid,omitempty"`
 	Ports         map[string][]portBinding `json:"Ports,omitempty"`
 	Health        *healthState             `json:"Health,omitempty"`

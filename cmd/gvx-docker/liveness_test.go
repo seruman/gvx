@@ -223,3 +223,43 @@ func TestStartReapsTheSupervisor(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestStartKeepsAnExitThatTheSupervisorRecorded proves that start does not
+// overwrite the state of a run that ended before start wrote its update. The
+// hook runs a supervisor that records the exit before start continues, which
+// is the order of a container that exits at once.
+func TestStartKeepsAnExitThatTheSupervisorRecorded(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "fake-gvx-docker")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := newContainerStore(filepath.Join(dir, "state"))
+	id := strings.Repeat("f", 64)
+	if err := store.create(containerRecord{ID: id, Created: time.Now(), State: containerState{Status: "created"}}); err != nil {
+		t.Fatal(err)
+	}
+	rt := processRuntime{exe: exe, paths: paths{stateDir: filepath.Join(dir, "state")}, store: store}
+	rt.afterSupervisorStart = func() {
+		_ = store.updateState(id, func(st *containerState) {
+			st.Running = false
+			st.Status = "exited"
+			st.ExitCode = 7
+			st.FinishedAt = time.Now().UTC()
+		})
+	}
+	if err := rt.start(context.Background(), containerRecord{ID: id}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.statePath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st containerState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Running || st.Status != "exited" || st.ExitCode != 7 {
+		t.Fatalf("state after start = running %v status %q exit %d, want the exit 7 that the supervisor recorded", st.Running, st.Status, st.ExitCode)
+	}
+}

@@ -235,6 +235,9 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 		return err
 	}
 	defer lock.release()
+	if err := store.updateState(rec.ID, func(st *containerState) { st.StartPending = time.Time{} }); err != nil {
+		return err
+	}
 	logFile, err := openRotatingLog(store.logPath(rec.ID), rec.HostConfig.LogConfig)
 	if err != nil {
 		return fmt.Errorf("open log: %w", err)
