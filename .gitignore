@@ -37,3 +37,4 @@ go.work.sum
 # .vscode/
 /rungv
 /rungv.exe
+/gvx-docker

@@ -186,6 +186,13 @@ var boundaryRules = []importRule{
 		forbiddenLiterals: []string{winHvDLL},
 	},
 	{
+		pkg:               "cmd/gvx-docker",
+		tier:              Tier1Additive,
+		allowed:           []string{"pkg/gvx", "pkg/oci", "github.com/opencontainers/go-digest", "github.com/opencontainers/image-spec/*"},
+		forbidden:         []string{pkgSentryAll, "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
+		forbiddenLiterals: []string{winHvDLL},
+	},
+	{
 		pkg:       "pkg/gvx",
 		tier:      Tier1Additive,
 		allowed:   []string{"pkg/oci", "pkg/netbackend", "pkg/hostlockdown", pkgSentryAll, "pkg/fd", "pkg/state", "pkg/tcpip/*"},
