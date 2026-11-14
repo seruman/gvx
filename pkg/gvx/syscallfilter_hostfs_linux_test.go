@@ -17,6 +17,7 @@
 package gvx
 
 import (
+	"net"
 	"testing"
 
 	"z.gfire.dev/gvx/internal/xsys/unix"
@@ -114,4 +115,23 @@ func flockArgReprs(t *testing.T, rules seccomp.SyscallRules, arg int) []string {
 		t.Fatalf("ForSingleArgument(SYS_FLOCK, %d): %v", arg, err)
 	}
 	return out
+}
+
+// TestEmbedderRulesAllowControlListenerAccept pins the calls that
+// AcceptControlConn makes after the lockdown: accept4, then getsockname and
+// getpeername for the address of the new connection. Without a network
+// backend no hostinet rule allows them, so the first accept would kill the
+// process with SIGSYS.
+func TestEmbedderRulesAllowControlListenerAccept(t *testing.T) {
+	ln := &net.UnixListener{}
+	rules := embedderRules(Config{NetworkMode: NetModeNone, ControlListener: ln}, false, false)
+	for name, sysno := range map[string]uintptr{
+		"accept4":     unix.SYS_ACCEPT4,
+		"getsockname": unix.SYS_GETSOCKNAME,
+		"getpeername": unix.SYS_GETPEERNAME,
+	} {
+		if !rules.Has(sysno) {
+			t.Errorf("embedderRules with a ControlListener lacks %s, so AcceptControlConn kills the process after the lockdown", name)
+		}
+	}
 }
