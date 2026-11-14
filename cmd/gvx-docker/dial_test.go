@@ -166,3 +166,65 @@ func TestSlowDialDoesNotBlockNameLookups(t *testing.T) {
 		t.Fatal("20 lookups did not finish in 1s behind a dial that does not answer")
 	}
 }
+
+// TestControlCallsTimeOutOnASilentShim proves that a control call fails when
+// the shim accepts and never answers. Without a deadline on the reply read,
+// the dial session, its supervisor goroutine, and the connect of the guest
+// wait until the target closes.
+func TestControlCallsTimeOutOnASilentShim(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gvx-silent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "c.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() })
+		}
+	}()
+	// A context deadline shorter than controlReplyTimeout bounds the reply
+	// read, so the test does not wait 30 seconds.
+	newCtx := func() context.Context {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		t.Cleanup(cancel)
+		return ctx
+	}
+
+	for name, call := range map[string]func() error{
+		"controlCall": func() error {
+			c, _, err := controlCall(newCtx(), sock, controlRequest{Op: "stat"})
+			if c != nil {
+				_ = c.Close()
+			}
+			return err
+		},
+		"controlCallRaw": func() error {
+			c, err := controlCallRaw(newCtx(), sock, controlRequest{Op: "dial"})
+			if c != nil {
+				_ = c.Close()
+			}
+			return err
+		},
+	} {
+		done := make(chan error, 1)
+		go func() { done <- call() }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Errorf("%s to a silent shim succeeded", name)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s to a silent shim did not return in 3s", name)
+		}
+	}
+}
