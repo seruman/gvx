@@ -58,6 +58,14 @@ A sandbox locks down its host process, so the process cannot start a second sand
 
 The shim opens its control socket before `hostlockdown.Apply()`. The API process sends `exec`, `resize`, and `dial` requests to that socket. The supervisor and the shim share one socket pair. The shim asks the supervisor for container names and for connections to other containers on that pair, because the lockdown blocks new Unix connections. The supervisor passes each new connection to the shim with `SCM_RIGHTS`.
 
+### 3.1 Liveness and Stop (Descriptive Module)
+
+Each supervisor holds an exclusive `flock` on `supervisor.lock` in its container directory for its whole life. The file contains the PID of the holder. The kernel releases the lock when the supervisor dies, also on `SIGKILL`. The engine therefore reads a container as running only while a process holds that lock, and it does not trust a PID: a zombie and a reused PID both answer `kill(pid, 0)`. The lock descriptor has `O_CLOEXEC`, so a shim never inherits it.
+
+The API process never signals a shim. It sends `SIGTERM` (stop) or `SIGUSR1` (kill) to the PID that the lock names, and only while the lock is held. The supervisor sends the stop signal of the container to its shim, waits for the timeout, then sends `SIGUSR2`, and then `SIGKILL`. The shim is an unreaped child of the supervisor, so its PID cannot name another process. `SIGKILL` of the supervisor is the last step of the API process. A shim ends with its supervisor: it reads a pipe from the supervisor and kills its guest when the pipe ends. On Linux, the shim also gets `SIGUSR2` as its parent death signal.
+
+Only the supervisor writes the state of a run. `docker start` writes `StartPending` before it starts the supervisor, and the container reads as running for at most 30 seconds until the supervisor takes its lock. One `serve` holds `serve.lock` in the state directory, so a second `serve` on the same directory exits with an error.
+
 A container gets one address on each of its networks. The guest keeps its NAT address. The DNS relay of the guest answers container names with those addresses. A guest connection to such an address leaves through the NAT forwarder, and the shim routes it to the guest of the target container.
 
 ## 4. Stored Data (Reference Module)
@@ -69,6 +77,8 @@ A container gets one address on each of its networks. The guest keeps its NAT ad
 | Container records | `~/.gvx/docker/containers/<id>/config.json` and `state.json` | Removed by `docker rm`. |
 | Container writable layer | `~/.gvx/docker/containers/<id>/rootfs.ext4` | Survives stop and start. Removed by `docker rm`. |
 | Container logs | `~/.gvx/docker/containers/<id>/log.json` | Rotated at a size limit. Removed by `docker rm`. |
+| Supervisor lock | `~/.gvx/docker/containers/<id>/supervisor.lock` | Held by the live supervisor. Removed by `docker rm`. |
+| Engine lock | `~/.gvx/docker/serve.lock` | Held by the live `serve`. |
 | Shim control socket | `~/.gvx/docker/run/<id12>.sock` | Exists while the container runs. |
 | Named volumes | `~/.gvx/docker/volumes/<name>/_data` | Host directories, so several containers share them. Removed by `docker volume rm` or `docker volume prune`. |
 | Networks | `~/.gvx/docker/networks/<id>.json` | Removed by `docker network rm`. |
