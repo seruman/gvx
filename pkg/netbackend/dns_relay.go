@@ -169,6 +169,7 @@ type dnsRelay struct {
 	hasGateway bool
 	isolateLAN bool
 	lookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
+	localNames func(ctx context.Context, name string) ([]netip.Addr, bool)
 	servers    []string
 	dials      []func(ctx context.Context, network, addr string) (net.Conn, error)
 	log        *slog.Logger
@@ -186,6 +187,7 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		hasGateway: true,
 		isolateLAN: nf.cfg.IsolateLAN,
 		lookupHost: nf.cfg.LookupHost,
+		localNames: nf.cfg.LocalNames,
 		servers:    nf.upstreamDNS,
 		dials:      []func(context.Context, string, string) (net.Conn, error){dialFn},
 		log:        nf.log,
@@ -294,6 +296,14 @@ func (r dnsRelay) lookupLocalAddrs(ctx context.Context, qname string) (addrs []n
 		}
 	case "gvx":
 		return r.gvxAddrs, true, true, nil
+	}
+	if r.localNames != nil {
+		if addrs, ok := r.localNames(ctx, clean); ok {
+			// A name with addresses exists for every query type. An AAAA
+			// query for a name with only IPv4 addresses gets an empty answer,
+			// not NXDOMAIN, which glibc takes as the end of the lookup.
+			return addrs, len(addrs) > 0, true, nil
+		}
 	}
 
 	if r.lookupHost == nil {

@@ -100,6 +100,12 @@ type NATConfig struct {
 	// link-local ranges, and host loopback addresses (including 10.0.2.2).
 	IsolateLAN bool
 
+	// LoopbackToHost sends a guest connection to a loopback address on which
+	// no guest socket listens to the same port on the host loopback. A
+	// builder uses it, so a build reaches a registry on localhost of the
+	// host, as with Docker. IsolateLAN overrides it.
+	LoopbackToHost bool
+
 	// DialContext dials outbound host connections. When nil, a default
 	// net.Dialer is used.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -108,6 +114,11 @@ type NATConfig struct {
 	// 10.0.2.3:53. When nil, the relay forwards the raw query to the host DNS
 	// servers that were discovered before lockdown.
 	LookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
+
+	// LocalNames answers A and AAAA queries before the upstream servers. It
+	// returns false for a name that it does not own. The embedder uses it for
+	// names of other sandboxes, such as Docker service names.
+	LocalNames func(ctx context.Context, name string) ([]netip.Addr, bool)
 
 	// DNSServers specifies upstream host DNS servers ("ip:port") for the
 	// virtual DNS relay. When empty, the host resolver configuration is
@@ -324,7 +335,43 @@ func NewNATStack(cfg NATConfig) (*stack.Stack, *NATForwarder, error) {
 		return nil, nil, err
 	}
 	registerNATTransportHandlers(hostStack, fwd)
+	if cfg.LoopbackToHost && !cfg.IsolateLAN {
+		registerLoopbackToHost(s, fwd)
+	}
 	return s, fwd, nil
+}
+
+// registerLoopbackToHost relays a guest TCP connection to a loopback port on
+// which no guest socket listens to the same port of the host loopback. A
+// loopback packet never leaves the guest stack, so the forwarder runs there,
+// and it ignores every other destination.
+func registerLoopbackToHost(s *stack.Stack, nf *NATForwarder) {
+	fwd := tcp.NewForwarder(s, defaultTCPReceiveWindow, nf.cfg.Tuning.Int(tuning.NATSynBacklog), nf.handleLoopbackTCP)
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		addr, ok := netip.AddrFromSlice(id.LocalAddress.AsSlice())
+		if !ok || !addr.IsLoopback() {
+			return false
+		}
+		return fwd.HandlePacket(id, pkt)
+	})
+}
+
+func (nf *NATForwarder) handleLoopbackTCP(r *tcp.ForwarderRequest) {
+	id := r.ID()
+	addr, _ := netip.AddrFromSlice(id.LocalAddress.AsSlice())
+	target := net.JoinHostPort(addr.String(), strconv.Itoa(int(id.LocalPort)))
+	if !tryAcquire(nf.tcpRelaySem) {
+		nf.log.Debug("netbackend: reject guest loopback connection: too many relays", "target", target)
+		r.Complete(true)
+		return
+	}
+	if !nf.spawn(func() {
+		defer releaseSlot(nf.tcpRelaySem)
+		nf.relayTCP(r, target)
+	}) {
+		releaseSlot(nf.tcpRelaySem)
+		r.Complete(true)
+	}
 }
 
 // hostNICID is the NIC of the host stack that connects to the guest eth0.
@@ -570,6 +617,47 @@ func SnapshotEth0Config(s *stack.Stack) (Eth0Config, bool) {
 // joins each setting that is invalid or that Netstack rejected. A setting
 // that fails does not stop the others.
 func (cfg Eth0Config) apply(s *stack.Stack) error {
+	return cfg.applyTo(s)
+}
+
+// AddGuestAddresses adds the addresses (CIDR form, such as "172.18.0.2/16") to
+// the guest eth0 of s and keeps 10.0.2.15. A route for each subnet goes
+// through eth0 to the host stack, so the guest reaches its peers on the
+// subnet directly, with its own address as the source.
+func AddGuestAddresses(s *stack.Stack, addrs []string) error {
+	var errs []error
+	table := s.GetRouteTable()
+	var extra []tcpip.Route
+	for _, text := range addrs {
+		prefix, err := netip.ParsePrefix(text)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("netbackend: guest address %q: %w", text, err))
+			continue
+		}
+		pa := tcpip.ProtocolAddress{
+			Protocol:          ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(prefix.Addr().AsSlice()), PrefixLen: prefix.Bits()},
+		}
+		if prefix.Addr().Is6() {
+			pa.Protocol = ipv6.ProtocolNumber
+		}
+		if err := s.AddProtocolAddress(Eth0NICID, pa, stack.AddressProperties{}); err != nil {
+			errs = append(errs, fmt.Errorf("netbackend: add %s to eth0: %s", prefix, err))
+			continue
+		}
+		extra = append(extra, tcpip.Route{
+			Destination: pa.AddressWithPrefix.Subnet(),
+			NIC:         Eth0NICID,
+			SourceHint:  pa.AddressWithPrefix.Address,
+		})
+	}
+	// The subnet routes come first, so the default route through the gateway
+	// does not shadow them.
+	s.SetRouteTable(append(extra, table...))
+	return errors.Join(errs...)
+}
+
+func (cfg Eth0Config) applyTo(s *stack.Stack) error {
 	if len(cfg.Addresses) > maxEth0Addresses || len(cfg.Routes) > maxEth0Routes {
 		return fmt.Errorf("netbackend: eth0 config has %d addresses and %d routes, above the limits %d and %d", len(cfg.Addresses), len(cfg.Routes), maxEth0Addresses, maxEth0Routes)
 	}
@@ -750,6 +838,44 @@ func (nf *NATForwarder) spawn(fn func()) bool {
 	return spawnTracked(&nf.mu, &nf.closed, &nf.wg, fn)
 }
 
+type guestSourceKey struct{}
+
+func withGuestSource(ctx context.Context, addr tcpip.Address, port uint16) context.Context {
+	ip, ok := netip.AddrFromSlice(addr.AsSlice())
+	if !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, guestSourceKey{}, netip.AddrPortFrom(ip, port))
+}
+
+// GuestSource returns the source address and port of the guest connection
+// that a NAT dial serves. NATConfig.DialContext reads it from its context.
+func GuestSource(ctx context.Context) (netip.AddrPort, bool) {
+	ap, ok := ctx.Value(guestSourceKey{}).(netip.AddrPort)
+	return ap, ok
+}
+
+// DialGuestFrom opens a connection to the guest from the host side of the
+// eth0 link with the source address src. The guest sees src as the peer, as
+// on a shared Docker network. The host stack spoofs the address, so src needs
+// no NIC. network is "tcp" or "udp".
+func (nf *NATForwarder) DialGuestFrom(ctx context.Context, network string, src, dst netip.AddrPort) (net.Conn, error) {
+	local := tcpip.FullAddress{NIC: hostNICID, Addr: tcpip.AddrFromSlice(src.Addr().AsSlice()), Port: src.Port()}
+	remote := tcpip.FullAddress{NIC: hostNICID, Addr: tcpip.AddrFromSlice(dst.Addr().AsSlice()), Port: dst.Port()}
+	proto := ipv4.ProtocolNumber
+	if dst.Addr().Is6() {
+		proto = ipv6.ProtocolNumber
+	}
+	switch network {
+	case "tcp":
+		return gonet.DialTCPWithBind(ctx, nf.stack, local, remote, proto)
+	case "udp":
+		return gonet.DialUDP(nf.stack, &local, &remote, proto)
+	default:
+		return nil, fmt.Errorf("netbackend: dial the guest over %q", network)
+	}
+}
+
 // ResolveOutboundTarget maps a guest destination IP and port to a host network
 // address. An address of the guest itself (loopback, the guest IP, or the
 // unspecified address) never leaves the guest: Netstack hands such a SYN to
@@ -842,7 +968,9 @@ func (nf *NATForwarder) handleTCP(r *tcp.ForwarderRequest) {
 // relayTCP dials targetAddr on the host and relays it to the guest connection
 // that r requests. It completes r in every case.
 func (nf *NATForwarder) relayTCP(r *tcp.ForwarderRequest, targetAddr string) {
-	hostConn, err := nf.cfg.DialContext(nf.ctx, "tcp", targetAddr)
+	id := r.ID()
+	ctx := withGuestSource(nf.ctx, id.RemoteAddress, id.RemotePort)
+	hostConn, err := nf.cfg.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		nf.log.Debug("netbackend: dial host TCP target", "target", targetAddr, "error", err)
 		r.Complete(true)
@@ -909,7 +1037,7 @@ func (nf *NATForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 		return false
 	}
 
-	hostConn, err := nf.cfg.DialContext(nf.ctx, "udp", targetAddr)
+	hostConn, err := nf.cfg.DialContext(withGuestSource(nf.ctx, id.RemoteAddress, id.RemotePort), "udp", targetAddr)
 	if err != nil {
 		nf.log.Debug("netbackend: dial host UDP target", "target", targetAddr, "error", err)
 		return false

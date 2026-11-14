@@ -219,6 +219,82 @@ func TestNATGuestLocalAddressesNeverReachHostServices(t *testing.T) {
 	}
 }
 
+// TestNATLoopbackToHostReachesHostLoopback proves that LoopbackToHost sends a
+// guest dial to 127.0.0.1 to the host service on that port, while the guest
+// address and IsolateLAN still keep the host out of reach.
+func TestNATLoopbackToHostReachesHostLoopback(t *testing.T) {
+	hostLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer func() { _ = hostLn.Close() }()
+	hostPort := uint16(hostLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			conn, err := hostLn.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Write([]byte("host"))
+			_ = conn.Close()
+		}
+	}()
+
+	s, natFwd, err := NewNATStack(NATConfig{LoopbackToHost: true})
+	if err != nil {
+		t.Fatalf("NewNATStack failed: %v", err)
+	}
+	defer func() {
+		_ = natFwd.Close()
+		s.Close()
+	}()
+	dial := func(addr [4]byte) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		conn, err := gonet.DialContextTCP(ctx, s, tcpip.FullAddress{Addr: tcpip.AddrFrom4(addr), Port: hostPort}, ipv4.ProtocolNumber)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		got, err := io.ReadAll(conn)
+		return string(got), err
+	}
+	if got, err := dial([4]byte{127, 0, 0, 1}); err != nil || got != "host" {
+		t.Errorf("guest dial to 127.0.0.1 = (%q, %v), want the host service", got, err)
+	}
+	if got, err := dial([4]byte{10, 0, 2, 15}); err == nil && got == "host" {
+		t.Errorf("guest dial to its own address reached the host service")
+	}
+
+}
+
+// TestNATLoopbackStaysInGuestByDefault proves that a guest dial to 127.0.0.1
+// does not reach a host service without LoopbackToHost, or with IsolateLAN.
+func TestNATLoopbackStaysInGuestByDefault(t *testing.T) {
+	hostLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer func() { _ = hostLn.Close() }()
+	hostPort := uint16(hostLn.Addr().(*net.TCPAddr).Port)
+	for _, cfg := range []NATConfig{{}, {LoopbackToHost: true, IsolateLAN: true}} {
+		s, natFwd, err := NewNATStack(cfg)
+		if err != nil {
+			t.Fatalf("NewNATStack failed: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, err := gonet.DialContextTCP(ctx, s, tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}), Port: hostPort}, ipv4.ProtocolNumber)
+		cancel()
+		if err == nil {
+			_ = conn.Close()
+			t.Errorf("NATConfig %+v: guest dial to 127.0.0.1 succeeded, want a refused connection", cfg)
+		}
+		_ = natFwd.Close()
+		s.Close()
+	}
+}
+
 func TestNATVirtualDNSRelayUDPAndTCP(t *testing.T) {
 	s, natFwd, err := NewNATStack(NATConfig{
 		IsolateLAN: true,
