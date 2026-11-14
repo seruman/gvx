@@ -17,8 +17,11 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -144,5 +147,45 @@ func TestRefreshStateIgnoresZombieSupervisor(t *testing.T) {
 	refreshProcessStateIn(dir, &state)
 	if state.Running || state.Status != "exited" {
 		t.Fatalf("state after refresh = running %v status %q, want an exited container", state.Running, state.Status)
+	}
+}
+
+// TestStartReapsTheSupervisor proves that the API process reaps a supervisor
+// that exits. An unreaped supervisor stays a zombie for the life of serve.
+func TestStartReapsTheSupervisor(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "fake-gvx-docker")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := newContainerStore(filepath.Join(dir, "state"))
+	id := strings.Repeat("b", 64)
+	if err := store.create(containerRecord{ID: id, Created: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	rt := processRuntime{exe: exe, paths: paths{stateDir: filepath.Join(dir, "state")}, store: store}
+	if err := rt.start(context.Background(), containerRecord{ID: id}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.statePath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st containerState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	pid := st.SupervisorPid
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out, _ := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		stat := strings.TrimSpace(string(out))
+		if stat == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("supervisor %d has ps stat %q after it exited, want it reaped", pid, stat)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
