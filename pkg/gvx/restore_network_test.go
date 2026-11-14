@@ -16,7 +16,9 @@ package gvx
 
 import (
 	"context"
+	"errors"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -111,4 +113,33 @@ func TestNewAndRestoreCloseTheCheckpointListenerOnEarlyFailure(t *testing.T) {
 			t.Fatal("Restore returned an error and left the checkpoint listener open")
 		}
 	})
+}
+
+// TestRestoreClosesTheControlListenerOnEarlyFailure proves that Restore owns
+// Config.ControlListener as New does, and closes it when it fails before the
+// sandbox exists.
+func TestRestoreClosesTheControlListenerOnEarlyFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback TCP is unavailable: %v", err)
+	}
+	counted := &closeCountingListener{Listener: ln}
+	defer ln.Close()
+	if _, err := Restore(context.Background(), Config{ControlListener: counted}, RestoreOptions{}); err == nil {
+		t.Fatal("Restore succeeded without a directory")
+	}
+	if counted.closed == 0 {
+		t.Fatal("Restore returned an error and left the control listener open")
+	}
+}
+
+// TestRestoreRejectsARootUpperImage proves that Restore refuses
+// RootfsUpperPath, which a restored guest cannot use, in place of dropping
+// the persistent upper layer without a word.
+func TestRestoreRejectsARootUpperImage(t *testing.T) {
+	cfg := Config{RootfsUpperPath: filepath.Join(t.TempDir(), "rootfs.ext4"), OCILayerTars: [][]byte{{}}}
+	_, err := Restore(context.Background(), cfg, RestoreOptions{Dir: t.TempDir()})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Restore with RootfsUpperPath = %v, want ErrInvalidConfig", err)
+	}
 }
