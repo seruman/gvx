@@ -991,3 +991,58 @@ func TestSandboxFailedRunReleasesTheRootUpperLayer(t *testing.T) {
 		t.Fatalf("ArchiveUpper after a failed run = %v, want ErrNotRunning", err)
 	}
 }
+
+// TestSandboxArchiveOpensRefuseAFIFO opens a FIFO through the two paths that
+// copy file data: the read of a regular file for ArchiveRead and the write of
+// a regular file for ArchiveWrite. A guest can put a FIFO at a path between
+// the type check and the open. A blocking open of a FIFO without a peer then
+// hangs the copy forever.
+func TestSandboxArchiveOpensRefuseAFIFO(t *testing.T) {
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755}, testimage.File{Name: "srv", Type: '5', Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hostTestConfig(t)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.Idle = true
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	go func() { _, _ = sb.Run(context.Background()) }()
+	var in bytes.Buffer
+	tw := tar.NewWriter(&in)
+	_ = tw.WriteHeader(&tar.Header{Name: "pipe", Typeflag: tar.TypeFifo, Mode: 0o644})
+	_ = tw.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err = sb.ArchiveWrite("/srv", bytes.NewReader(in.Bytes()))
+		if !errors.Is(err, ErrNotRunning) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("ArchiveWrite of a FIFO: %v", err)
+	}
+	for name, open := range map[string]func(g guestFS) error{
+		"read":  func(g guestFS) error { return g.copyFileOut(io.Discard, "/srv/pipe", 5) },
+		"write": func(g guestFS) error { _, err := g.openRegularForWrite("/srv/pipe", 0o644); return err },
+	} {
+		done := make(chan error, 1)
+		go func() { done <- sb.withGuestFS(open) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Errorf("%s open of a FIFO succeeded, want an error", name)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s open of a FIFO blocked for 2s", name)
+		}
+	}
+}
