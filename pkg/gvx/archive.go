@@ -217,8 +217,43 @@ func (g guestFS) listDir(p string) ([]string, error) {
 	return names, err
 }
 
+// openRegular opens p with flags and returns it only when it is a regular
+// file. The guest runs while a copy runs, so it can replace a regular file
+// with a FIFO or a device between the type check of the caller and this
+// open. The open uses O_NONBLOCK, so a FIFO without a peer cannot block it,
+// and the check of the opened file refuses everything but a regular file.
+// The function then clears O_NONBLOCK for the copy.
+func (g guestFS) openRegular(p string, flags uint32, mode linux.FileMode) (*vfs.FileDescription, error) {
+	fd, err := g.vfs.OpenAt(g.ctx, g.creds, g.pop(p, false), &vfs.OpenOptions{
+		Flags: flags | linux.O_NONBLOCK | linux.O_NOFOLLOW,
+		Mode:  mode,
+	})
+	if err != nil {
+		return nil, err
+	}
+	st, err := fd.Stat(g.ctx, vfs.StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil {
+		fd.DecRef(g.ctx)
+		return nil, err
+	}
+	if st.Mode&linux.S_IFMT != linux.S_IFREG {
+		fd.DecRef(g.ctx)
+		return nil, fmt.Errorf("gvx: %s is no longer a regular file", p)
+	}
+	if err := fd.SetStatusFlags(g.ctx, g.creds, fd.StatusFlags()&^linux.O_NONBLOCK); err != nil {
+		fd.DecRef(g.ctx)
+		return nil, err
+	}
+	return fd, nil
+}
+
+// openRegularForWrite creates or truncates the regular file p for writing.
+func (g guestFS) openRegularForWrite(p string, mode linux.FileMode) (*vfs.FileDescription, error) {
+	return g.openRegular(p, linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC, mode)
+}
+
 func (g guestFS) copyFileOut(w io.Writer, p string, size int64) error {
-	fd, err := g.vfs.OpenAt(g.ctx, g.creds, g.pop(p, false), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	fd, err := g.openRegular(p, linux.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -299,10 +334,7 @@ func (g guestFS) extract(dir string, hdr *tar.Header, r io.Reader) error {
 		}
 	case tar.TypeReg, tar.TypeRegA:
 		g.removeNonDir(target)
-		fd, err := g.vfs.OpenAt(g.ctx, g.creds, g.pop(target, false), &vfs.OpenOptions{
-			Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC | linux.O_NOFOLLOW,
-			Mode:  mode,
-		})
+		fd, err := g.openRegularForWrite(target, mode)
 		if err != nil {
 			return err
 		}
