@@ -1055,6 +1055,9 @@ func (s *server) streamLogs(ctx context.Context, w io.Writer, rec containerRecor
 		}
 	}
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 && line[len(line)-1] == '\n' {
 			var e logEntry
@@ -1179,6 +1182,21 @@ func writeLogEntry(w io.Writer, e logEntry, opts logOptions) {
 	}
 }
 
+// cancelOnWriteError calls cancel when a write to w fails, so a follower that
+// writes to a client that left stops at once.
+type cancelOnWriteError struct {
+	w      io.Writer
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnWriteError) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if err != nil {
+		c.cancel()
+	}
+	return n, err
+}
+
 func writeFrame(w io.Writer, stream byte, payload []byte) {
 	var header [8]byte
 	header[0] = stream
@@ -1268,7 +1286,13 @@ func (s *server) attachContainer(w http.ResponseWriter, r *http.Request, ref str
 		case <-ctx.Done():
 		}
 	}()
-	s.streamLogs(ctx, conn, rec, logOptions{stdout: stdout, stderr: stderr, follow: true, tail: tail, raw: rec.Config.Tty, startAtEnd: tail == 0, runAfter: followAfter})
+	// A write to a client that left fails. End the follower then: a read
+	// cannot tell a closed client from one that closed only its input.
+	out := &cancelOnWriteError{w: conn, cancel: cancel}
+	s.streamLogs(ctx, out, rec, logOptions{stdout: stdout, stderr: stderr, follow: true, tail: tail, raw: rec.Config.Tty, startAtEnd: tail == 0, runAfter: followAfter})
+	if s.attachDone != nil {
+		s.attachDone()
+	}
 }
 
 // forwardAttachInput sends the client input to the stdin of the main process.
