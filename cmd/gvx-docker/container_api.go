@@ -192,10 +192,15 @@ func (s *server) createContainer(w http.ResponseWriter, r *http.Request) {
 		name = generatedName(id)
 	}
 	anonymous := anonymousVolumes(img.Config.Volumes, req.Volumes, req.HostConfig)
-	binds, seeds, err := s.resolveBinds(append(req.HostConfig.Binds, anonymous...), req.HostConfig.Mounts)
+	binds, seeds, anonymousMounts, err := s.resolveBindsWithAnonymous(append(req.HostConfig.Binds, anonymous...), req.HostConfig.Mounts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	anonymousNames := anonymousMounts
+	for _, b := range anonymous {
+		name, _, _ := strings.Cut(b, ":")
+		anonymousNames = append(anonymousNames, name)
 	}
 	req.HostConfig.Binds = binds
 	req.HostConfig.Mounts = withoutVolumeMounts(req.HostConfig.Mounts)
@@ -211,10 +216,11 @@ func (s *server) createContainer(w http.ResponseWriter, r *http.Request) {
 	rec := containerRecord{
 		ID: id, Name: name, Created: time.Now().UTC(), ImageID: img.ID,
 		Config: req.containerConfig, HostConfig: req.HostConfig,
-		State:       containerState{Status: "created", Ports: ports},
-		SeedVolumes: seeds,
-		ConsoleRows: consoleRows,
-		ConsoleCols: consoleCols,
+		State:            containerState{Status: "created", Ports: ports},
+		SeedVolumes:      seeds,
+		AnonymousVolumes: anonymousNames,
+		ConsoleRows:      consoleRows,
+		ConsoleCols:      consoleCols,
 	}
 	applyImageDefaults(&rec.Config, img.Config.Entrypoint, img.Config.Cmd, img.Config.Env, img.Config.WorkingDir, img.Config.User)
 	if rec.Config.StopSignal == "" {
@@ -917,6 +923,12 @@ func (s *server) removeContainer(w http.ResponseWriter, r *http.Request, ref str
 	if err := s.containers.remove(rec.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if v := r.URL.Query().Get("v"); v == "1" || v == "true" {
+		if err := removeAnonymousVolumes(rec, s.volumeRoot()); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

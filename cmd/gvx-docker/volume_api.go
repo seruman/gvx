@@ -236,16 +236,23 @@ func (s *server) pruneVolumes(w http.ResponseWriter) {
 // resolveBinds turns named volumes in binds and mounts into host directories.
 // A bind with an absolute source stays.
 func (s *server) resolveBinds(binds []string, mounts []mountSpec) ([]string, []string, error) {
+	out, seeds, _, err := s.resolveBindsWithAnonymous(binds, mounts)
+	return out, seeds, err
+}
+
+// resolveBindsWithAnonymous is resolveBinds that also returns the names of
+// the volumes it made for volume mounts without a name.
+func (s *server) resolveBindsWithAnonymous(binds []string, mounts []mountSpec) ([]string, []string, []string, error) {
 	out := make([]string, 0, len(binds)+len(mounts))
-	var seeds []string
+	var seeds, anonymous []string
 	for _, b := range binds {
 		src, rest, ok := strings.Cut(b, ":")
 		if !ok {
-			return nil, nil, fmt.Errorf("invalid bind %q", b)
+			return nil, nil, nil, fmt.Errorf("invalid bind %q", b)
 		}
 		if !strings.HasPrefix(src, "/") {
 			if _, err := s.ensureVolume(src, nil); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			src = s.volumeDataDir(src)
 			target, _, _ := strings.Cut(rest, ":")
@@ -270,12 +277,13 @@ func (s *server) resolveBinds(binds []string, mounts []mountSpec) ([]string, []s
 			if name == "" {
 				id, err := newContainerID()
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				name = id
+				anonymous = append(anonymous, name)
 			}
 			if _, err := s.ensureVolume(name, nil); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			out = append(out, s.volumeDataDir(name)+":"+m.Target+mode)
 			if m.VolumeOptions == nil || !m.VolumeOptions.NoCopy {
@@ -284,8 +292,8 @@ func (s *server) resolveBinds(binds []string, mounts []mountSpec) ([]string, []s
 		case "tmpfs":
 			// handled by sandboxConfig through Tmpfs.
 		default:
-			return nil, nil, fmt.Errorf("unsupported mount type %q", m.Type)
+			return nil, nil, nil, fmt.Errorf("unsupported mount type %q", m.Type)
 		}
 	}
-	return out, seeds, nil
+	return out, seeds, anonymous, nil
 }
