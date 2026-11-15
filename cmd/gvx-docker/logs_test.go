@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -244,5 +245,91 @@ func TestAttachEndsWhenTheClientLeaves(t *testing.T) {
 	case <-followerDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the attach follower kept running after its client closed the connection")
+	}
+}
+
+// TestStartAttachOfAnExitedContainerForwardsInput attaches with stdin to an
+// exited container, as docker start -ai does before it starts it. Input that
+// the client sends while the old exit is still recorded must reach the stdin
+// of the next run. The fake control socket of the next run records it.
+func TestStartAttachOfAnExitedContainerForwardsInput(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gvx-sai-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	s := &server{containers: newContainerStore(dir), networks: newNetworkStore(dir), stateDir: dir}
+	id := strings.Repeat("8", 64)
+	old := time.Now().UTC().Add(-time.Minute)
+	rec := containerRecord{ID: id, Created: old, Config: containerConfig{OpenStdin: true, StdinOnce: true, AttachStdin: true},
+		State: containerState{Status: "exited", ExitCode: 0, StartedAt: old, FinishedAt: old}}
+	if err := s.containers.create(rec); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "POST /containers/%s/attach?stream=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", id)
+	br := bufio.NewReader(conn)
+	if status, _ := br.ReadString('\n'); !strings.Contains(status, "101") {
+		t.Fatalf("attach answered %q", status)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
+		}
+	}
+	// The client sends its input before the start, as a pipe into
+	// docker start -ai does.
+	if _, err := conn.Write([]byte("typed before start\n")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// The next run starts and serves its control socket.
+	if err := os.MkdirAll(filepath.Join(dir, "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", controlSocketPath(dir, id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		r := bufio.NewReader(c)
+		_, _ = r.ReadBytes('\n')
+		_, _ = c.Write([]byte("{\"ok\":true}\n"))
+		data, _ := io.ReadAll(r)
+		got <- string(data)
+	}()
+	lock, err := acquireSupervisorLock(s.containers.dir(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.release()
+	_ = s.containers.updateState(id, func(st *containerState) {
+		st.Running, st.Status, st.StartedAt, st.FinishedAt = true, "running", time.Now().UTC(), time.Time{}
+	})
+	if cw, ok := conn.(*net.TCPConn); ok {
+		_ = cw.CloseWrite()
+	}
+	select {
+	case data := <-got:
+		if data != "typed before start\n" {
+			t.Fatalf("the next run got stdin %q, want the input of the client", data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the input of the client never reached the next run")
 	}
 }
