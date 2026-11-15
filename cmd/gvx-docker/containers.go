@@ -235,7 +235,11 @@ func (s *containerStore) create(rec containerRecord) error {
 	}
 	defer unlock()
 	if rec.Name != "" {
-		if _, err := s.findLocked(rec.Name); err == nil {
+		inUse, err := s.nameInUseLocked(rec.Name, "")
+		if err != nil {
+			return err
+		}
+		if inUse {
 			return fmt.Errorf("%w: container name %q is already in use", errConflict, rec.Name)
 		}
 	}
@@ -416,6 +420,23 @@ func (s *containerStore) get(ref string) (containerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.findLocked(ref)
+}
+
+// nameInUseLocked reports whether a container other than exceptID has the
+// name. Only an equal name counts: a name that matches the start of an ID,
+// such as "cafe", is a valid name. The caller holds the store lock.
+func (s *containerStore) nameInUseLocked(name, exceptID string) (bool, error) {
+	name = strings.TrimPrefix(name, "/")
+	records, err := s.listLocked()
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range records {
+		if rec.ID != exceptID && rec.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *containerStore) findLocked(ref string) (containerRecord, error) {
