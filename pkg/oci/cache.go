@@ -72,6 +72,7 @@ type LayerCache struct {
 	mu       sync.Mutex
 	verified map[string]verifiedLayer
 	// keepBlobs keeps the original compressed layer blobs in blobs/sha256.
+	// Guarded by mu.
 	// See EnableBlobStore.
 	keepBlobs bool
 }
@@ -347,7 +348,10 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 	// so it equals the hash of the whole stream.
 	digester := digest.SHA256.Digester()
 	var blob *os.File
-	if c.keepBlobs {
+	c.mu.Lock()
+	keepBlob := c.keepBlobs
+	c.mu.Unlock()
+	if keepBlob {
 		if blob, err = c.createTempBlob(); err != nil {
 			return "", CompileStats{}, err
 		}

@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 )
@@ -62,4 +64,25 @@ func TestFetchMissingBlobsKeepsAValidBlobOnAMismatch(t *testing.T) {
 	if err != nil || digest.FromBytes(got).Encoded() != validHex {
 		t.Fatalf("the stored blob changed: %v", err)
 	}
+}
+
+// TestEnableBlobStoreDuringAPull turns the blob store on while a pull
+// compiles layers. Run it with -race: the compiler reads the setting that
+// EnableBlobStore writes. The blob hook turns the store on while a layer
+// downloads, so the write and the read overlap on every run.
+func TestEnableBlobStoreDuringAPull(t *testing.T) {
+	reg := newFakeRegistry(t)
+	img := twoLayerImage(t, "arm64", "A=1")
+	reg.addImage(img)
+	reg.tag("latest", img.digest())
+	cache := newCache(t)
+	reg.onBlob = func(w http.ResponseWriter, r *http.Request, d string) bool {
+		if r.Method != http.MethodGet {
+			return false
+		}
+		go cache.EnableBlobStore()
+		time.Sleep(20 * time.Millisecond)
+		return false
+	}
+	mustPull(t, reg, cache, "latest", "arm64")
 }
