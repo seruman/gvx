@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -169,6 +170,7 @@ type dnsRelay struct {
 	hasGateway bool
 	isolateLAN bool
 	lookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
+	fallback   func(ctx context.Context, host string) ([]netip.Addr, error)
 	localNames func(ctx context.Context, name string) ([]netip.Addr, bool)
 	servers    []string
 	dials      []func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -187,6 +189,7 @@ func (nf *NATForwarder) dnsRelay() dnsRelay {
 		hasGateway: true,
 		isolateLAN: nf.cfg.IsolateLAN,
 		lookupHost: nf.cfg.LookupHost,
+		fallback:   nf.cfg.FallbackLookupHost,
 		localNames: nf.cfg.LocalNames,
 		servers:    nf.upstreamDNS,
 		dials:      []func(context.Context, string, string) (net.Conn, error){dialFn},
@@ -266,14 +269,53 @@ func (r dnsRelay) answerQuery(ctx context.Context, req []byte) []byte {
 		}
 	}
 
-	resp, err := r.forwardRawUpstream(ctx, req)
+	// The whole query shares one budget. A fallback for address queries
+	// keeps a part of it, so silent servers cannot use up its time.
+	budget := r.tune.Duration(tuning.DNSTimeout)
+	qctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	addressQuery := q.Class == dnsmessage.ClassINET && (q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA)
+	useFallback := r.fallback != nil && addressQuery
+	var reserve time.Duration
+	if useFallback {
+		reserve = budget / fallbackBudgetShare
+	}
+	resp, err := r.forwardRawUpstreamWithin(qctx, req, reserve)
+	if err == nil {
+		return resp
+	}
+	if r.log != nil {
+		r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
+	}
+	if useFallback && ctx.Err() == nil {
+		if resp := r.answerFromFallback(qctx, reqHdr, q, name); resp != nil {
+			return resp
+		}
+	}
+	return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure)
+}
+
+// fallbackBudgetShare is the divisor of the query budget that the relay keeps
+// for the fallback of an address query.
+const fallbackBudgetShare = 4
+
+// answerFromFallback resolves an address query through the fallback after
+// every upstream server failed. It returns nil when the fallback fails, so the
+// guest gets SERVFAIL as before. A failed fallback never gives NXDOMAIN: a
+// host resolver that the lockdown blocks also reports "no such host", and a
+// false NXDOMAIN stays in the negative cache of the guest.
+func (r dnsRelay) answerFromFallback(ctx context.Context, reqHdr dnsmessage.Header, q dnsmessage.Question, name string) []byte {
+	addrs, err := r.fallback(ctx, name)
 	if err != nil {
 		if r.log != nil {
-			r.log.Debug("netbackend: forward DNS query", "name", name, "error", err)
+			r.log.Debug("netbackend: fallback DNS lookup", "name", name, "error", err)
 		}
-		return buildDNSErrorResponse(reqHdr, &q, dnsmessage.RCodeServerFailure)
+		return nil
 	}
-	return resp
+	if r.isolateLAN {
+		addrs = slices.DeleteFunc(slices.Clone(addrs), isBlockedHostAddr)
+	}
+	return buildDNSAddressResponse(reqHdr, q, addrs)
 }
 
 // lookupLocalAddrs resolves the names that the relay answers without an
@@ -359,6 +401,32 @@ func randomDNSTxID() (uint16, error) {
 }
 
 func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, error) {
+	return r.forwardRawUpstreamWithin(ctx, req, 0)
+}
+
+// upstreamAttemptTimeout returns the time limit of the next exchange. Each
+// remaining exchange gets an equal share of the time before the deadline,
+// less reserve, so one silent server does not use up the time of the next.
+// The limit never exceeds the upstream tunable.
+func upstreamAttemptTimeout(ctx context.Context, perServer, reserve time.Duration, attemptsLeft int) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok || attemptsLeft <= 0 {
+		return perServer
+	}
+	share := (time.Until(deadline) - reserve) / time.Duration(attemptsLeft)
+	if share < minUpstreamAttempt {
+		share = minUpstreamAttempt
+	}
+	return min(share, perServer)
+}
+
+// minUpstreamAttempt is the shortest exchange that the relay starts. A
+// shorter one cannot finish a round trip to a remote server.
+const minUpstreamAttempt = 50 * time.Millisecond
+
+// forwardRawUpstreamWithin is forwardRawUpstream that leaves reserve of the
+// context time unused for a later fallback.
+func (r dnsRelay) forwardRawUpstreamWithin(ctx context.Context, req []byte, reserve time.Duration) ([]byte, error) {
 	if len(r.servers) == 0 {
 		return nil, errNoDNSServers
 	}
@@ -367,14 +435,18 @@ func (r dnsRelay) forwardRawUpstream(ctx context.Context, req []byte) ([]byte, e
 		return nil, fmt.Errorf("netbackend: invalid DNS query: %w", err)
 	}
 	var errs []error
+	perServer := r.tune.Duration(tuning.DNSUpstreamTimeout)
+	attemptsLeft := len(r.servers) * len(r.dials)
 	for _, server := range r.servers {
 		for _, dial := range r.dials {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			resp, respHdr, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+			timeout := upstreamAttemptTimeout(ctx, perServer, reserve, attemptsLeft)
+			attemptsLeft--
+			resp, respHdr, err := exchangeDNSWithDial(ctx, dial, "udp", server, req, reqHdr.ID, wantQ, timeout)
 			if err == nil && respHdr.Truncated {
-				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, r.tune.Duration(tuning.DNSUpstreamTimeout))
+				resp, respHdr, err = exchangeDNSWithDial(ctx, dial, "tcp", server, req, reqHdr.ID, wantQ, timeout)
 			}
 			if err != nil {
 				errs = append(errs, fmt.Errorf("server %s: %w", server, err))

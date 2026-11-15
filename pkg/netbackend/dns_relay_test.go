@@ -1163,3 +1163,173 @@ func TestDNSRelayForwardsCNAMEAndPTRAnswersFromUpstream(t *testing.T) {
 		t.Fatalf("PTRResource = %+v, err = %v", ptrRes, err)
 	}
 }
+
+// fallbackRecorder is a FallbackLookupHost that answers from a fixed table
+// and records the names that it was asked for.
+type fallbackRecorder struct {
+	mu    sync.Mutex
+	names []string
+	addrs map[string][]netip.Addr
+}
+
+func (f *fallbackRecorder) lookup(_ context.Context, host string) ([]netip.Addr, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.names = append(f.names, host)
+	if addrs, ok := f.addrs[host]; ok {
+		return addrs, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+func (f *fallbackRecorder) asked() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.names)
+}
+
+func dnsBudget(t *testing.T, budget time.Duration) tuning.Values {
+	t.Helper()
+	tuned, err := tuning.Values{}.WithDuration(tuning.DNSTimeout, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tuned
+}
+
+// TestDNSRelayFallsBackWhenEveryServerTimesOut uses two servers that never
+// answer. Each gets a share of the query budget, so the fallback still
+// answers the guest inside the budget.
+func TestDNSRelayFallsBackWhenEveryServerTimesOut(t *testing.T) {
+	a := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
+	b := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
+	fb := &fallbackRecorder{addrs: map[string][]netip.Addr{
+		"registry.example.": {netip.MustParseAddr("198.51.100.20"), netip.MustParseAddr("2001:db8::20")},
+	}}
+	const budget = 900 * time.Millisecond
+	nf := newTestForwarder(t, NATConfig{Tuning: dnsBudget(t, budget), FallbackLookupHost: fb.lookup}, a.addr, b.addr)
+
+	start := time.Now()
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(3, "registry.example", dnsTypeA))
+	took := time.Since(start)
+	if dnsRCode(resp) != dnsRCodeNoErr {
+		t.Fatalf("rcode = %d after %v, want NOERROR from the fallback", dnsRCode(resp), took)
+	}
+	if got := answerIPs(t, resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.20")}) {
+		t.Fatalf("answer = %v, want [198.51.100.20]", got)
+	}
+	if took >= budget {
+		t.Fatalf("relay answered after %v, want less than the %v budget", took, budget)
+	}
+	if a.queries.Load() == 0 || b.queries.Load() == 0 {
+		t.Fatalf("servers saw %d and %d queries, want both asked first", a.queries.Load(), b.queries.Load())
+	}
+	if got := fb.asked(); !slices.Equal(got, []string{"registry.example."}) {
+		t.Fatalf("fallback asked for %q, want the fully qualified name once", got)
+	}
+}
+
+// TestDNSRelayFallsBackAfterSERVFAIL answers an AAAA query through the
+// fallback when the only server answers SERVFAIL. A name that the fallback
+// cannot resolve keeps SERVFAIL.
+func TestDNSRelayFallsBackAfterSERVFAIL(t *testing.T) {
+	srv := startFakeDNSServer(t, rcodeResponse(dnsRCodeSrv))
+	fb := &fallbackRecorder{addrs: map[string][]netip.Addr{
+		"registry.example.": {netip.MustParseAddr("198.51.100.20"), netip.MustParseAddr("2001:db8::20")},
+	}}
+	nf := newTestForwarder(t, NATConfig{FallbackLookupHost: fb.lookup}, srv.addr)
+
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(4, "registry.example", dnsTypeAAAA))
+	if dnsRCode(resp) != dnsRCodeNoErr {
+		t.Fatalf("rcode = %d, want NOERROR from the fallback", dnsRCode(resp))
+	}
+	if got := answerIPs(t, resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("2001:db8::20")}) {
+		t.Fatalf("answer = %v, want [2001:db8::20]", got)
+	}
+	// A failed fallback keeps SERVFAIL. A blocked host resolver also says
+	// "no such host", and a false NXDOMAIN stays in the guest cache.
+	resp = nf.handleDNSQuery(t.Context(), buildDNSQuery(5, "missing.example", dnsTypeA))
+	if dnsRCode(resp) != dnsRCodeSrv {
+		t.Fatalf("missing name: rcode = %d, want SERVFAIL", dnsRCode(resp))
+	}
+}
+
+// TestDNSRelayKeepsUpstreamAnswersAndNonAddressFailures proves that the
+// fallback runs only for A and AAAA queries that no server answered.
+func TestDNSRelayKeepsUpstreamAnswersAndNonAddressFailures(t *testing.T) {
+	nx := startFakeDNSServer(t, rcodeResponse(dnsRCodeNX))
+	fb := &fallbackRecorder{addrs: map[string][]netip.Addr{"gone.example.": {netip.MustParseAddr("198.51.100.30")}}}
+	nf := newTestForwarder(t, NATConfig{FallbackLookupHost: fb.lookup}, nx.addr)
+	if resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(6, "gone.example", dnsTypeA)); dnsRCode(resp) != dnsRCodeNX {
+		t.Fatalf("rcode = %d, want the NXDOMAIN of the server", dnsRCode(resp))
+	}
+
+	fail := startFakeDNSServer(t, rcodeResponse(dnsRCodeSrv))
+	nf = newTestForwarder(t, NATConfig{FallbackLookupHost: fb.lookup}, fail.addr)
+	const typeTXT = 16
+	if resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(7, "gone.example", typeTXT)); dnsRCode(resp) != dnsRCodeSrv {
+		t.Fatalf("TXT rcode = %d, want SERVFAIL", dnsRCode(resp))
+	}
+	if got := fb.asked(); len(got) != 0 {
+		t.Fatalf("fallback asked for %q, want no call", got)
+	}
+}
+
+// TestDNSRelayFallbackObeysIsolateLAN filters LAN and loopback addresses out
+// of a fallback answer, as for the LookupHost hook.
+func TestDNSRelayFallbackObeysIsolateLAN(t *testing.T) {
+	srv := startFakeDNSServer(t, rcodeResponse(dnsRCodeSrv))
+	fb := &fallbackRecorder{addrs: map[string][]netip.Addr{"rebind.example.": {
+		netip.MustParseAddr("127.0.0.1"),
+		netip.MustParseAddr("172.16.5.10"),
+		netip.MustParseAddr("10.0.2.2"),
+		netip.MustParseAddr("169.254.169.254"),
+		netip.MustParseAddr("198.51.100.40"),
+	}}}
+	nf := newTestForwarder(t, NATConfig{IsolateLAN: true, FallbackLookupHost: fb.lookup}, srv.addr)
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(8, "rebind.example", dnsTypeA))
+	if got := answerIPs(t, resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("198.51.100.40")}) {
+		t.Fatalf("answer = %v, want only [198.51.100.40]", got)
+	}
+}
+
+// TestDNSRelaySlowServerLeavesTimeForTheNext puts two silent servers before
+// a working one. Without a fallback, each server still gets only a share of
+// the query budget, so the third server answers inside it.
+func TestDNSRelaySlowServerLeavesTimeForTheNext(t *testing.T) {
+	a := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
+	b := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
+	good := startFakeDNSServer(t, answerWith("203.0.113.50"))
+	const budget = 900 * time.Millisecond
+	nf := newTestForwarder(t, NATConfig{Tuning: dnsBudget(t, budget)}, a.addr, b.addr, good.addr)
+
+	start := time.Now()
+	resp := nf.handleDNSQuery(t.Context(), buildDNSQuery(9, "slow.example", dnsTypeA))
+	took := time.Since(start)
+	if got := answerIPs(t, resp); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("203.0.113.50")}) {
+		t.Fatalf("answer = %v after %v, want [203.0.113.50] from the third server", got, took)
+	}
+	if took >= budget {
+		t.Fatalf("relay answered after %v, want less than the %v budget", took, budget)
+	}
+}
+
+// TestWireGuardDNSRelayHasNoFallback keeps every guest query of the
+// WireGuard backend on its configured servers: a fallback through the host
+// resolver would send the name outside the tunnel.
+func TestWireGuardDNSRelayHasNoFallback(t *testing.T) {
+	guestKey, peerKey := newWGKeyPair(t), newWGKeyPair(t)
+	w, err := NewWireGuardEndpoint(WireGuardConfig{
+		PrivateKey:     guestKey.private,
+		PeerPublicKey:  peerKey.public,
+		DNSServers:     []string{"192.0.2.53"},
+		HostDNSServers: []string{"192.0.2.54"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	if w.dnsRelay(nil).fallback != nil {
+		t.Fatal("the WireGuard DNS relay has a fallback")
+	}
+}
