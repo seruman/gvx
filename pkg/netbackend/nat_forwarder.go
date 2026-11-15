@@ -881,12 +881,56 @@ func (nf *NATForwarder) DialGuestFrom(ctx context.Context, network string, src, 
 	}
 	switch network {
 	case "tcp":
-		return gonet.DialTCPWithBind(ctx, nf.stack, local, remote, proto)
+		return dialTCPFrom(ctx, nf.stack, local, remote, proto)
 	case "udp":
 		return gonet.DialUDP(nf.stack, &local, &remote, proto)
 	default:
 		return nil, fmt.Errorf("netbackend: dial the guest over %q", network)
 	}
+}
+
+// dialTCPFrom connects to remote from local through s. A guest that closes a
+// connection first leaves the host end in TIME-WAIT for a minute, and the
+// peer guest can pick the same source port again in that time. The exact
+// source then cannot be bound, so the dial binds the same source address
+// with a free port. The target sees the right peer address with another
+// port, as behind a NAT.
+func dialTCPFrom(ctx context.Context, s *stack.Stack, local, remote tcpip.FullAddress, proto tcpip.NetworkProtocolNumber) (net.Conn, error) {
+	var wq waiter.Queue
+	ep, tcpErr := s.NewEndpoint(tcp.ProtocolNumber, proto, &wq)
+	if tcpErr != nil {
+		return nil, errors.New(tcpErr.String())
+	}
+	if tcpErr := ep.Bind(local); tcpErr != nil {
+		if _, inUse := tcpErr.(*tcpip.ErrPortInUse); !inUse {
+			ep.Close()
+			return nil, fmt.Errorf("netbackend: bind %v: %s", local, tcpErr)
+		}
+		any := local
+		any.Port = 0
+		if tcpErr := ep.Bind(any); tcpErr != nil {
+			ep.Close()
+			return nil, fmt.Errorf("netbackend: bind %v: %s", any, tcpErr)
+		}
+	}
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	wq.EventRegister(&waitEntry)
+	defer wq.EventUnregister(&waitEntry)
+	tcpErr = ep.Connect(remote)
+	if _, started := tcpErr.(*tcpip.ErrConnectStarted); started {
+		select {
+		case <-ctx.Done():
+			ep.Close()
+			return nil, ctx.Err()
+		case <-notifyCh:
+		}
+		tcpErr = ep.LastError()
+	}
+	if tcpErr != nil {
+		ep.Close()
+		return nil, fmt.Errorf("netbackend: connect %v: %s", remote, tcpErr)
+	}
+	return gonet.NewTCPConn(&wq, ep), nil
 }
 
 // ResolveOutboundTarget maps a guest destination IP and port to a host network
