@@ -111,6 +111,17 @@ func (c *LayerCache) publishBlob(f *os.File, hexDigest string) error {
 
 // StoreBlob stores the stream r as a blob and returns its sha256 in hex.
 func (c *LayerCache) StoreBlob(r io.Reader) (string, int64, error) {
+	return c.storeBlob(r, nil)
+}
+
+// blobCheck tells whether a stream with the sha256 hexDigest and size bytes
+// may be published.
+type blobCheck func(hexDigest string, size int64) error
+
+// storeBlob writes r to a temporary blob, then runs check on its digest and
+// size before it publishes the blob. A refused stream removes only the
+// temporary file, never a blob that the store holds already.
+func (c *LayerCache) storeBlob(r io.Reader, check blobCheck) (string, int64, error) {
 	f, err := c.createTempBlob()
 	if err != nil {
 		return "", 0, err
@@ -123,6 +134,13 @@ func (c *LayerCache) StoreBlob(r io.Reader) (string, int64, error) {
 		return "", 0, fmt.Errorf("oci: write blob: %w", err)
 	}
 	hexDigest := fmt.Sprintf("%x", h.Sum(nil))
+	if check != nil {
+		if err := check(hexDigest, n); err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return hexDigest, n, err
+		}
+	}
 	return hexDigest, n, c.publishBlob(f, hexDigest)
 }
 
@@ -179,14 +197,15 @@ func (c *LayerCache) FetchMissingBlobs(ctx context.Context, img Image) error {
 		if err != nil {
 			return err
 		}
-		hexDigest, size, err := c.StoreBlob(io.LimitReader(body, l.Size+1))
+		_, _, err = c.storeBlob(io.LimitReader(body, l.Size+1), func(hexDigest string, size int64) error {
+			if hexDigest != l.Digest.Encoded() || size != l.Size {
+				return fmt.Errorf("%w: blob %s from %s has sha256 %s and %d bytes", ErrDigestMismatch, l.Digest, repo, hexDigest, size)
+			}
+			return nil
+		})
 		_ = body.Close()
 		if err != nil {
 			return err
-		}
-		if hexDigest != l.Digest.Encoded() || size != l.Size {
-			_ = os.Remove(filepath.Join(c.blobDir(), hexDigest))
-			return fmt.Errorf("%w: blob %s from %s has sha256 %s and %d bytes", ErrDigestMismatch, l.Digest, repo, hexDigest, size)
 		}
 	}
 	return nil
