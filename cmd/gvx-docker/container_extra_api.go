@@ -352,6 +352,7 @@ func (s *server) pruneContainers(w http.ResponseWriter) {
 		}
 		size := fileSize(s.containers.rootfsPath(c.ID))
 		if s.containers.remove(c.ID) == nil {
+			s.idleShims.forget(c.ID)
 			// Docker's container prune also removes anonymous volumes.
 			_ = s.containers.removeAnonymousVolumes(c, s.volumeRoot())
 			deleted = append(deleted, c.ID)

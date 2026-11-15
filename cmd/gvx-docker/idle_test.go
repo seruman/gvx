@@ -422,3 +422,28 @@ func TestNewIdleSandboxKeepsItsSocketWhenTheOldOneStops(t *testing.T) {
 		t.Fatalf("the new idle sandbox lost its socket to the stop of the old one: %v", err)
 	}
 }
+
+// TestRemoveDropsTheStartLockOfTheContainer starts and removes a container
+// through the API. The start lock of the container must go with it, so the
+// map of start locks does not grow with every container that ever ran.
+func TestRemoveDropsTheStartLockOfTheContainer(t *testing.T) {
+	id := strings.Repeat("b", 64)
+	s := fakeIdleShimServer(t, id)
+	// A copy takes the start lock of the container, as a start does.
+	_, release, err := s.archiveControl(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/containers/"+id, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("rm = %d %s", rec.Code, rec.Body.String())
+	}
+	s.idleShims.mu.Lock()
+	_, kept := s.idleShims.starts[id]
+	s.idleShims.mu.Unlock()
+	if kept {
+		t.Fatal("the start lock of a removed container stays in the map")
+	}
+}
