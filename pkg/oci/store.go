@@ -557,7 +557,9 @@ func (c *LayerCache) removeUnusedLayers(candidates []string) error {
 		c.mu.Lock()
 		delete(c.verified, hexStr)
 		c.mu.Unlock()
-		for _, p := range []string{filepath.Join(c.dir, hexStr+c.layerSuffix()), c.sumPath(hexStr)} {
+		// The blob of the layer goes with the layer: the cache key of a
+		// layer is the digest of its blob.
+		for _, p := range []string{filepath.Join(c.dir, hexStr+c.layerSuffix()), c.sumPath(hexStr), filepath.Join(c.blobDir(), hexStr)} {
 			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 				errs = append(errs, fmt.Errorf("oci: remove unused layer file: %w", err))
 			}
