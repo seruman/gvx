@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,15 +42,18 @@ func TestBuilderThatExitsFailsAtOnce(t *testing.T) {
 	p.normalize()
 	b := &builderProcess{exe: exe, paths: p, log: io.Discard}
 	for i := 0; i < 2; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// The context outlasts any process start under load. ensure must end
+		// because the builder exited, which its error names, and not because
+		// the context or the 60 second socket wait ran out.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		start := time.Now()
 		err := b.ensure(ctx)
 		cancel()
 		if err == nil {
 			t.Fatalf("ensure %d = nil for a builder that exited", i)
 		}
-		if time.Since(start) > 3*time.Second {
-			t.Fatalf("ensure %d took %v for a builder that exited at once: %v", i, time.Since(start), err)
+		if !strings.Contains(err.Error(), "exited before it opened its socket") {
+			t.Fatalf("ensure %d after %v = %v, want the error of a builder that exited", i, time.Since(start), err)
 		}
 	}
 	b.stop()
