@@ -486,6 +486,10 @@ func TestInterruptStormKeepsCountersConsistent(t *testing.T) {
 // does. An interruption inside the EL1 stub must not leave the stub exit for a
 // later entry to replay against the new state. A replayed exit skips the
 // handler, so X2 keeps its old value.
+//
+// Known issue: with GOMAXPROCS=1 the guest never enters within the test
+// timeout, before and after 57932739; nothing runs the test that way by
+// default.
 func TestInterruptDuringSyscallExitIsNotReplayed(t *testing.T) {
 	const handlerAddr = guestCodeAddr + 0x10
 	plat := newTestPlatform(t)

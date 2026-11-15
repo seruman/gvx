@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/gvx/internal/acceptprog"
 	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
@@ -722,4 +723,73 @@ func TestCheckpointStopKillsNATGuestWhenSaveRemovedTheNetwork(t *testing.T) {
 
 func TestCheckpointLeaveRunningKeepsNetworkedGuestAfterPostSaveFailure(t *testing.T) {
 	runFailedCheckpoint(t, failedCheckpointCase{mode: NetModeNAT, leaveRunning: true})
+}
+
+// TestRestoredGuestReadsTheClockThroughTheVDSO checkpoints a guest that
+// waits on stdin and restores it. The restored timekeeper must write the
+// clock parameters to the vDSO page of the restored guest, and the guest time
+// must follow the host clock.
+//
+// Known limit: in about 3 of 10 restores, the realtime clock of the vDSO page
+// stays not ready while the monotonic clock is ready. Wall time reads then
+// take the system call path; the time stays correct. Any Sentry logging
+// hides the race. Before the vDSO fix, every clock read of a restored guest
+// was a system call. The probe measures 3 s after the restore, after the
+// restored calibration settles.
+func TestRestoredGuestReadsTheClockThroughTheVDSO(t *testing.T) {
+	cacheDir := t.TempDir()
+	probe := acceptprog.BuildClockProbe(t, runtime.GOARCH)
+	ckptDir := filepath.Join(t.TempDir(), "bundle")
+	stdinR, stdinW := net.Pipe()
+	defer stdinR.Close()
+	defer stdinW.Close()
+
+	stdout1 := newNotifyBuffer()
+	cfg := newCheckpointTestConfig(t, cacheDir)
+	cfg.BinaryPath = probe
+	cfg.Argv = []string{"wait"}
+	cfg.CheckpointDir = ckptDir
+	cfg.Stdin = stdinR
+	cfg.Stdout = stdout1
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer sb.Close()
+	runCh := make(chan error, 1)
+	go func() {
+		_, rErr := sb.Run(context.Background())
+		runCh <- rErr
+	}()
+	stdout1.waitForSubstring(t, "waiting\n", 15*time.Second)
+	if err := sb.Checkpoint(context.Background(), CheckpointOptions{LeaveRunning: false}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := <-runCh; err != nil {
+		t.Fatalf("stopped sandbox Run: %v", err)
+	}
+	if err := sb.Close(); err != nil {
+		t.Fatalf("stopped sandbox Close: %v", err)
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	restoreCfg := newCheckpointTestConfig(t, cacheDir)
+	restoreCfg.BinaryPath = probe
+	restoreCfg.Stdin = strings.NewReader("go\n")
+	restoreCfg.Stdout = &stdout2
+	restoreCfg.Stderr = &stderr2
+	restored, err := Restore(context.Background(), restoreCfg, RestoreOptions{Dir: ckptDir})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	defer func() {
+		if cErr := restored.Close(); cErr != nil {
+			t.Errorf("restored Close: %v", cErr)
+		}
+	}()
+	code, err := restored.Run(context.Background())
+	if err != nil || code != 0 {
+		t.Fatalf("restored Run = (%d, %v); stderr=%q", code, err, stderr2.String())
+	}
+	checkClockProbe(t, stdout2.String(), time.Now().UnixNano(), false)
 }
