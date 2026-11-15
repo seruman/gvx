@@ -145,3 +145,13 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Unwrap lets http.ResponseController reach the original writer.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// supervisorLogName is the log of the supervisor of a container, in the
+// directory of the container. It holds the runs, their exit codes, and the
+// errors of the supervisor and of the shim before the guest starts.
+const supervisorLogName = "supervisor.log"
+
+// openSupervisorLog opens the supervisor log of a container for appending.
+func openSupervisorLog(store *containerStore, id string) (*os.File, error) {
+	return os.OpenFile(filepath.Join(store.dir(id), supervisorLogName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+}

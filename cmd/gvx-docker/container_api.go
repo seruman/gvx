@@ -52,6 +52,9 @@ type processRuntime struct {
 	// afterSupervisorStart runs between the start of the supervisor and the
 	// state update of start. Tests use it to order the two writers.
 	afterSupervisorStart func()
+	// afterSupervisorExit runs after the supervisor process was reaped.
+	// Tests use it.
+	afterSupervisorExit func()
 }
 
 func (r processRuntime) start(_ context.Context, rec containerRecord) error {
@@ -75,8 +78,14 @@ func (r processRuntime) start(_ context.Context, rec containerRecord) error {
 	}
 	cmd := exec.Command(r.exe, "supervise", "-state-dir", r.paths.stateDir, rec.ID)
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	// The supervisor outlives this process, so it writes to a file of its
+	// own: an error before it starts its log would be lost otherwise.
+	// A log that cannot open leaves the output discarded, as before; it
+	// must not block the start.
+	if supLog, err := openSupervisorLog(r.store, rec.ID); err == nil {
+		cmd.Stdout, cmd.Stderr = supLog, supLog
+		defer func() { _ = supLog.Close() }()
+	}
 	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		_ = r.store.updateState(rec.ID, func(st *containerState) {
@@ -96,6 +105,9 @@ func (r processRuntime) start(_ context.Context, rec containerRecord) error {
 		// A supervisor that died before it took its lock leaves the start
 		// pending. End it, so the container reads as exited at once.
 		_ = r.store.updateState(rec.ID, func(st *containerState) { st.StartPending = time.Time{} })
+		if r.afterSupervisorExit != nil {
+			r.afterSupervisorExit()
+		}
 	}()
 	if r.afterSupervisorStart != nil {
 		r.afterSupervisorStart()

@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // syncBuffer is a bytes.Buffer that the handler and the test share.
@@ -138,5 +140,63 @@ func TestEngineLogTeesToTheFile(t *testing.T) {
 	}
 	if old, err := os.Stat(path + ".1"); err != nil || old.Size() != engineLogMaxSize+1 {
 		t.Fatalf("engine.log.1 = %v, %v; want the old log", old, err)
+	}
+}
+
+// TestSupervisorOutputReachesItsLog starts a supervisor that fails before
+// the container runs. Its error must reach supervisor.log of the container;
+// a supervisor with discarded output leaves no trace of the failure.
+func TestSupervisorOutputReachesItsLog(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "fake-gvx-docker")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho 'gvx-docker supervise: boom' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := paths{stateDir: filepath.Join(dir, "state")}
+	p.normalize()
+	store := newContainerStore(p.stateDir)
+	id := strings.Repeat("7", 64)
+	if err := store.create(containerRecord{ID: id, Created: time.Now(), State: containerState{Status: "created"}}); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	rt := processRuntime{exe: exe, paths: p, store: store, afterSupervisorExit: func() { close(exited) }}
+	if err := rt.start(context.Background(), containerRecord{ID: id}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the supervisor did not exit")
+	}
+	data, err := os.ReadFile(filepath.Join(store.dir(id), "supervisor.log"))
+	if err != nil || !strings.Contains(string(data), "boom") {
+		t.Fatalf("supervisor.log = %q, %v; want the error of the supervisor", data, err)
+	}
+}
+
+// TestSuperviseLogsEachRun runs a container whose shim exits with 3. The
+// supervisor log names the run and its exit code.
+func TestSuperviseLogsEachRun(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "fake-gvx-docker")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 3\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := paths{stateDir: filepath.Join(dir, "state")}
+	p.normalize()
+	store := newContainerStore(p.stateDir)
+	id := strings.Repeat("8", 64)
+	if err := store.create(containerRecord{ID: id, Created: time.Now(), State: containerState{Status: "created"}}); err != nil {
+		t.Fatal(err)
+	}
+	var out syncBuffer
+	if err := supervise(context.Background(), exe, p, store, id, slog.New(slog.NewTextHandler(&out, nil))); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"msg=\"start run\"", "msg=\"run ended\"", "code=3"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("supervisor log lacks %q:\n%s", want, out.String())
+		}
 	}
 }

@@ -79,6 +79,8 @@ A container gets one address on each of its networks. The guest keeps its NAT ad
 | Container records | `~/.gvx/docker/containers/<id>/config.json` and `state.json` | Removed by `docker rm`. |
 | Container writable layer | `~/.gvx/docker/containers/<id>/rootfs.ext4` | Survives stop and start. Removed by `docker rm`. |
 | Container logs | `~/.gvx/docker/containers/<id>/log.json` | Rotated at a size limit. Removed by `docker rm`. |
+| Supervisor log | `~/.gvx/docker/containers/<id>/supervisor.log` | Each run and its exit code, restarts, and the errors of the supervisor and of the shim before the guest starts. Removed by `docker rm`. |
+| Engine log | `~/.gvx/docker/engine.log` | One line for each API request with the method, the path, the status, and the error text, plus the output of `serve` and of the builder. `serve` also writes it to stderr. Headers and query strings stay out of it. `serve` moves a log larger than 10 MB to `engine.log.1` at start. |
 | Setup record | `~/.gvx/docker/setup.json` | Lists the Buildx instance files that `setup` wrote. Removed by `setup -remove`. |
 | Supervisor lock | `~/.gvx/docker/containers/<id>/supervisor.lock` | Held by the live supervisor. Removed by `docker rm`. |
 | Engine lock | `~/.gvx/docker/serve.lock` | Held by the live `serve`. |
