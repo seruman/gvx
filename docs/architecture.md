@@ -982,6 +982,17 @@ The tests `TestE2EMemoryAccountingIsPerSandbox`, `TestE2EMemoryLimitCountsOnlyIt
 
 ![Pre-Lockdown Checkpoint and Restore Pipeline](assets/checkpoint-restore.svg)
 
+#### Restored Guest Clock: Known Limits (Descriptive Module)
+
+The restored timekeeper writes the clock parameters to the vDSO page of the restored guest. `CLOCK_MONOTONIC` never goes back after a restore, through the vDSO or the system call. Two limits remain, and both keep the time correct.
+
+| Limit | Effect |
+| :--- | :--- |
+| In about 3 of 10 restores, the realtime clock of the vDSO page stays not ready while the monotonic clock is ready. | Wall time reads take the system call path, at about 1.6 µs each. Monotonic reads stay in the vDSO. |
+| For about 1.5 s after a restore, the restored calibration settles. | The wall clock can run up to 50 ms ahead of the host clock, then returns to within 0.2 ms. |
+
+`TestRestoredGuestReadsTheClockThroughTheVDSO` checks both limits and the monotonic rule. `gvx-docker` does not use checkpoint or restore.
+
 #### Bundle Layout and Binary Formats (Reference Module)
 
 A checkpoint directory (`0700`) holds four `0600` files pre-opened before lockdown. Repeated live checkpoints (`LeaveRunning: true`) rewind and truncate those four descriptors in place, then sync `pages.img`, `pages.meta`, `state.img`, and `manifest.json` in order.
