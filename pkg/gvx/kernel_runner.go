@@ -43,7 +43,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
 	"z.gfire.dev/gvx/pkg/sentry/strace"
-	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sentry/watchdog"
@@ -387,7 +386,7 @@ func (s *Sandbox) initFreshKernel(mf *pgalloc.MemoryFile, hostRAM uint64) (*kern
 	// page empty, and every clock read of the guest would become a system
 	// call.
 	vdsoParams := kernel.NewVDSOParamPage(mf, vdso.ParamPage.FileRange())
-	tk.SetClocks(sentrytime.NewCalibratedClocks(false), vdsoParams)
+	tk.SetClocks(newGuestClocks(), vdsoParams)
 
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
 	rootNetNS, cleanupNetLog := s.initKernelRootNetworkNamespace(k, creds)
