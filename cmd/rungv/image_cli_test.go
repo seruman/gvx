@@ -200,6 +200,11 @@ func TestRmiOfTheLastNameDeletesTheImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
+		// The cache lock stays: it orders the writers and sweeps of every
+		// process that shares the cache.
+		if e.Name() == ".cache.lock" {
+			continue
+		}
 		t.Errorf("the cache still holds %s after the last image went", e.Name())
 	}
 }
