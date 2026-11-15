@@ -60,6 +60,11 @@ func LoadArchive(r io.Reader, cache *LayerCache, targetArch string) ([]LoadedIma
 			return nil, err
 		}
 	}
+	release, err := cache.LockWrites()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	_, _, _, targetArch = normalizePullArgs("", "", "", targetArch)
 
 	a, cleanup, err := cache.openArchive(r)

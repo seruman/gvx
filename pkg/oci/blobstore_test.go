@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // TestFetchMissingBlobsKeepsAValidBlobOnAMismatch makes a registry send the
@@ -179,5 +180,116 @@ func TestRemoveDeletesTheBlobsOfItsUnusedLayers(t *testing.T) {
 		if _, ok := cache.BlobPath(digest.FromBytes(b).Encoded()); ok {
 			t.Fatalf("Remove kept the blob of a layer that no image uses")
 		}
+	}
+}
+
+// TestPruneDuringACommitKeepsTheNewImage runs a prune between the publish of
+// a committed layer and the write of its image record, as a script that
+// prunes while a build loads its result can. The blob has no registry
+// source, so a prune that deletes it loses the image for good. The prune
+// must wait for the writer, and the image must stay complete.
+func TestPruneDuringACommitKeepsTheNewImage(t *testing.T) {
+	cache := newCache(t)
+	cache.EnableBlobStore()
+	raw := buildTar(t, dirEntry("app/"), fileEntry("app/data", "committed"))
+	blob := gzipBytes(t, raw)
+	config := []byte(`{"architecture":"arm64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":["` + sha256Digest(raw) + `"]}}`)
+	name, err := ParseReference("committed:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pruneDone := make(chan error, 1)
+	cache.beforeImageRecord = func() {
+		go func() {
+			// A prune of dangling images keeps a tagged image, but its sweep
+			// of unused files ran before the record existed.
+			_, err := cache.PruneImages(PruneOptions{Arch: "arm64"})
+			pruneDone <- err
+		}()
+		// Give a prune that does not wait time to run its sweep.
+		select {
+		case err := <-pruneDone:
+			pruneDone <- err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+
+	release, err := cache.LockWrites()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hexDigest, size, err := cache.StoreBlob(bytes.NewReader(blob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := []ocispec.Descriptor{{MediaType: ocispec.MediaTypeImageLayerGzip, Digest: digest.NewDigestFromEncoded(digest.SHA256, hexDigest), Size: size}}
+	if _, err := cache.StoreImage(config, layers, []Reference{name}); err != nil {
+		t.Fatalf("StoreImage: %v", err)
+	}
+	release()
+	if err := <-pruneDone; err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+
+	if _, ok := cache.BlobPath(hexDigest); !ok {
+		t.Fatal("the prune deleted the blob of an image that was being written")
+	}
+	if _, ok := cache.HasLayer(hexDigest); !ok {
+		t.Fatal("the prune deleted the layer of an image that was being written")
+	}
+	sel, err := cache.Select("committed:1", "arm64")
+	if err != nil || len(sel.Images) == 0 {
+		t.Fatalf("Select of the committed image: %v", err)
+	}
+	content, err := cache.ImageContent(sel.Images[0])
+	if err != nil || !content.BlobsComplete {
+		t.Fatalf("ImageContent = complete %v, %v; want a complete image for save and push", content.BlobsComplete, err)
+	}
+}
+
+// TestNestedWriteLockDoesNotWaitBehindASweep holds the write lock, starts a
+// sweep that waits for it, and takes the write lock again, as StoreImage does
+// under a caller that holds it since StoreBlob. The nested hold must not wait
+// behind the sweep.
+func TestNestedWriteLockDoesNotWaitBehindASweep(t *testing.T) {
+	cache := newCache(t)
+	outer, err := cache.LockWrites()
+	if err != nil {
+		t.Fatal(err)
+	}
+	swept := make(chan struct{})
+	go func() {
+		release, err := cache.lockSweep()
+		if err == nil {
+			release()
+		}
+		close(swept)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	nested := make(chan func(), 1)
+	go func() {
+		inner, err := cache.LockWrites()
+		if err != nil {
+			t.Error(err)
+		}
+		nested <- inner
+	}()
+	select {
+	case inner := <-nested:
+		inner()
+	case <-time.After(2 * time.Second):
+		t.Fatal("a nested write lock waits behind a sweep that waits for the outer one")
+	}
+	select {
+	case <-swept:
+		t.Fatal("the sweep ran while a writer held the lock")
+	default:
+	}
+	outer()
+	select {
+	case <-swept:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the sweep did not run after the writer released the lock")
 	}
 }

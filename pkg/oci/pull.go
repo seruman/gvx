@@ -408,6 +408,11 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 			return nil, err
 		}
 	}
+	release, err := cache.LockWrites()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	baseURL, repository, reference, targetArch = normalizePullArgs(baseURL, repository, reference, targetArch)
 
 	// A digest names immutable content, so a cached image needs no network.

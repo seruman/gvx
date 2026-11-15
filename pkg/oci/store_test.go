@@ -431,6 +431,10 @@ func TestRemoveDeletesEveryNameAndAllUnsharedLayers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
+		// The cache lock stays: it orders writers and sweeps of every process.
+		if e.Name() == cacheLockName {
+			continue
+		}
 		t.Errorf("the cache directory still holds %s", e.Name())
 	}
 }

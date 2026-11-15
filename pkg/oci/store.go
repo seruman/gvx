@@ -445,6 +445,16 @@ func (c *LayerCache) Untag(img Image, tag string) (RemoveReport, error) {
 // Remove deletes every name of img, its image record, and the layer images that
 // no other image uses.
 func (c *LayerCache) Remove(img Image) (RemoveReport, error) {
+	release, err := c.lockSweep()
+	if err != nil {
+		return RemoveReport{}, err
+	}
+	defer release()
+	return c.removeLocked(img)
+}
+
+// removeLocked is Remove for a caller that holds the cache lock exclusive.
+func (c *LayerCache) removeLocked(img Image) (RemoveReport, error) {
 	var report RemoveReport
 	for _, tag := range img.Tags {
 		if err := c.removeTagRecord(img, tag, &report); err != nil {

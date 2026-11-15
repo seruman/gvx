@@ -51,6 +51,14 @@ type CacheDiskUsage struct {
 // for opts.Arch, sweeps orphaned tag, layer, and sum files, and reports the
 // bytes reclaimed on disk.
 func (c *LayerCache) PruneImages(opts PruneOptions) (PruneReport, error) {
+	// A writer publishes files before the image record that uses them. The
+	// exclusive lock waits for every writer, so no file of an image that is
+	// being written looks unused.
+	release, err := c.lockSweep()
+	if err != nil {
+		return PruneReport{}, err
+	}
+	defer release()
 	beforeBytes, err := c.cacheFileBytes()
 	if err != nil {
 		return PruneReport{}, err
@@ -66,7 +74,7 @@ func (c *LayerCache) PruneImages(opts PruneOptions) (PruneReport, error) {
 		if !opts.All && img.Referenced() {
 			continue
 		}
-		rep, err := c.Remove(img)
+		rep, err := c.removeLocked(img)
 		for _, u := range rep.Untagged {
 			if !slices.Contains(report.Untagged, u) {
 				report.Untagged = append(report.Untagged, u)
