@@ -17,9 +17,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -81,5 +87,116 @@ func TestLogFollowerKeepsTheLastLinesOfAnExit(t *testing.T) {
 	}
 	if got := out.String(); got != "first\nlast words\n" {
 		t.Fatalf("follower printed %q, want both lines", got)
+	}
+}
+
+// exitedContainer creates an exited container with exit code 5 that ended a
+// minute ago, as before docker start -a, and holds no supervisor lock.
+func exitedContainer(t *testing.T, s *server, id string) {
+	t.Helper()
+	old := time.Now().UTC().Add(-time.Minute)
+	rec := containerRecord{ID: id, Created: old, State: containerState{Status: "exited", ExitCode: 5, StartedAt: old, FinishedAt: old}}
+	if err := s.containers.create(rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runAgain records a new run of container id that prints line and exits with
+// code 7, as start and the supervisor do.
+func runAgain(t *testing.T, s *server, id, line string) {
+	t.Helper()
+	_ = s.containers.updateState(id, func(st *containerState) {
+		st.Running, st.Status, st.StartedAt, st.FinishedAt = true, "running", time.Now().UTC(), time.Time{}
+		st.StartPending = time.Now().UTC()
+	})
+	time.Sleep(150 * time.Millisecond)
+	appendLog(t, s.containers, id, line)
+	_ = s.containers.updateState(id, func(st *containerState) {
+		st.Running, st.Status, st.ExitCode, st.FinishedAt = false, "exited", 7, time.Now().UTC()
+		st.StartPending = time.Time{}
+	})
+}
+
+// TestWaitNextExitWaitsForANewRun asks for the next exit of a container that
+// exited before, as docker start -a does before it starts the container. The
+// wait must return the code of the new run, not the old one.
+func TestWaitNextExitWaitsForANewRun(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{containers: newContainerStore(dir), networks: newNetworkStore(dir), stateDir: dir}
+	id := strings.Repeat("6", 64)
+	exitedContainer(t, s, id)
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	result := make(chan string, 1)
+	go func() {
+		resp, err := http.Post(srv.URL+"/containers/"+id+"/wait?condition=next-exit", "application/json", nil)
+		if err != nil {
+			result <- err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		result <- strings.TrimSpace(string(b))
+	}()
+	select {
+	case got := <-result:
+		t.Fatalf("wait for the next exit returned %s before a new run", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	runAgain(t, s, id, "new run\n")
+	select {
+	case got := <-result:
+		if got != `{"StatusCode":7}` {
+			t.Fatalf("wait = %s, want the exit code 7 of the new run", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait did not return after the new run exited")
+	}
+}
+
+// TestAttachToAnExitedContainerFollowsTheNextRun attaches to a container
+// that exited before, as docker start -a does before it starts it. The stream
+// must carry the output of the new run and end with it.
+func TestAttachToAnExitedContainerFollowsTheNextRun(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{containers: newContainerStore(dir), networks: newNetworkStore(dir), stateDir: dir}
+	id := strings.Repeat("5", 64)
+	exitedContainer(t, s, id)
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "POST /containers/%s/attach?stream=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", id)
+	br := bufio.NewReader(conn)
+	if status, _ := br.ReadString('\n'); !strings.Contains(status, "101") {
+		t.Fatalf("attach answered %q", status)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
+		}
+	}
+	got := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(br)
+		got <- string(b)
+	}()
+	select {
+	case out := <-got:
+		t.Fatalf("attach ended before the new run with %q", out)
+	case <-time.After(300 * time.Millisecond):
+	}
+	runAgain(t, s, id, "new run\n")
+	select {
+	case out := <-got:
+		if !strings.Contains(out, "new run") {
+			t.Fatalf("attach stream = %q, want the output of the new run", out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("attach did not end after the new run exited")
 	}
 }

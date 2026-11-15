@@ -882,6 +882,11 @@ func (s *server) waitContainer(w http.ResponseWriter, r *http.Request, ref strin
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	// next-exit waits for the end of a run that is not over at the time of
+	// the request: the current one, or a later one. docker start -a asks for
+	// it before it starts an exited container, so the old exit must not
+	// count.
+	staleRun := !rec.State.Running && !rec.State.Restarting && rec.State.Status == "exited"
 	for {
 		current, err := s.containers.get(rec.ID)
 		if err != nil {
@@ -889,9 +894,15 @@ func (s *server) waitContainer(w http.ResponseWriter, r *http.Request, ref strin
 			_ = json.NewEncoder(w).Encode(map[string]any{"StatusCode": code})
 			return
 		}
-		if condition == "removed" {
+		ended := !current.State.Running && !current.State.Restarting
+		newRun := !staleRun || current.State.StartedAt.After(rec.State.StartedAt)
+		switch {
+		case condition == "removed":
 			// keep waiting until the record goes away.
-		} else if !current.State.Running && !current.State.Restarting && (current.State.Status == "exited" || condition == "not-running") {
+		case condition == "not-running" && ended:
+			_ = json.NewEncoder(w).Encode(map[string]any{"StatusCode": current.State.ExitCode})
+			return
+		case ended && current.State.Status == "exited" && (condition != "next-exit" || newRun):
 			_ = json.NewEncoder(w).Encode(map[string]any{"StatusCode": current.State.ExitCode})
 			return
 		}
@@ -977,6 +988,9 @@ type logOptions struct {
 	tail                                    int
 	// startAtEnd skips the existing log, as an attach to a running container.
 	startAtEnd bool
+	// runAfter makes a follower ignore an exit of a run that started at or
+	// before this time. It waits for a later run and follows it to its exit.
+	runAfter time.Time
 	// since and until bound the entries by time. Zero means no bound.
 	since, until time.Time
 }
@@ -1074,7 +1088,8 @@ func (s *server) streamLogs(ctx context.Context, w io.Writer, rec containerRecor
 				s.logEOFHook()
 			}
 			current, getErr := s.containers.get(rec.ID)
-			if getErr != nil || current.State.Status == "exited" {
+			staleExit := getErr == nil && !opts.runAfter.IsZero() && !current.State.StartedAt.After(opts.runAfter)
+			if getErr != nil || (current.State.Status == "exited" && !staleExit) {
 				// The container can write its last lines after the read
 				// above and before its exit. Read the rest once more.
 				drainLog(reader, w, opts)
@@ -1232,6 +1247,16 @@ func (s *server) attachContainer(w http.ResponseWriter, r *http.Request, ref str
 	if rec.State.Running || rec.State.Status == "exited" {
 		tail = 0
 	}
+	// An attach to an exited container follows its next run, as docker
+	// start -a attaches before it starts the container. The follower must
+	// not end on the exit that comes before the attach.
+	followAfter := time.Time{}
+	if !rec.State.Running && !rec.State.Restarting && rec.State.Status == "exited" {
+		followAfter = rec.State.StartedAt
+		if followAfter.IsZero() {
+			followAfter = time.Unix(0, 1)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -1243,7 +1268,7 @@ func (s *server) attachContainer(w http.ResponseWriter, r *http.Request, ref str
 		case <-ctx.Done():
 		}
 	}()
-	s.streamLogs(ctx, conn, rec, logOptions{stdout: stdout, stderr: stderr, follow: true, tail: tail, raw: rec.Config.Tty, startAtEnd: tail == 0})
+	s.streamLogs(ctx, conn, rec, logOptions{stdout: stdout, stderr: stderr, follow: true, tail: tail, raw: rec.Config.Tty, startAtEnd: tail == 0, runAfter: followAfter})
 }
 
 // forwardAttachInput sends the client input to the stdin of the main process.
