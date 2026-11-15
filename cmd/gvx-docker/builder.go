@@ -54,7 +54,7 @@ func (b *builderProcess) ensure(ctx context.Context) error {
 	}
 	b.mu.Lock()
 	if b.cmd == nil || isClosed(b.exited) {
-		cmd := exec.Command(b.exe, "builder", "-state-dir", b.paths.stateDir, "-buildkit-image", b.paths.buildkitImage)
+		cmd := exec.Command(b.exe, b.builderArgs()...)
 		cmd.Stdout = b.log
 		cmd.Stderr = b.log
 		if err := cmd.Start(); err != nil {
@@ -86,6 +86,16 @@ func (b *builderProcess) ensure(ctx context.Context) error {
 	return err
 }
 
+// builderArgs returns the arguments of the builder subcommand, with the
+// builder options of serve.
+func (b *builderProcess) builderArgs() []string {
+	args := []string{"builder", "-state-dir", b.paths.stateDir, "-buildkit-image", b.paths.buildkitImage}
+	if b.paths.builderHostLoopback {
+		args = append(args, "-builder-host-loopback")
+	}
+	return args
+}
+
 // isClosed reports whether ch is closed. A nil channel is open.
 func isClosed(ch <-chan struct{}) bool {
 	select {
@@ -111,42 +121,7 @@ func runBuildKit(ctx context.Context, p paths, stderr io.Writer) (int, error) {
 	if err := os.MkdirAll(p.stateDir, 0o700); err != nil {
 		return 0, fmt.Errorf("create state directory: %w", err)
 	}
-	cfg := gvx.Config{
-		Platform:    gvx.PlatformAuto,
-		NetworkMode: gvx.NetModeNAT,
-		// A build reaches a registry on localhost of the Mac, such as a
-		// registry container that publishes its port there.
-		LoopbackToHost:         true,
-		NetRaw:                 true,
-		AllowPacketSocketWrite: true,
-		AllowSUID:              true,
-		OCIImage:               p.buildkitImage,
-		PullPolicy:             gvx.PullMissing,
-		Warnings:               stderr,
-		Stdin:                  nil,
-		Stdout:                 stderr,
-		Stderr:                 stderr,
-		PortForwards: []gvx.PortForward{{
-			GuestPort:  buildKitGuestPort,
-			Protocol:   "tcp",
-			HostSocket: p.backendSock,
-		}},
-		Mounts: []gvx.Mount{{
-			Kind:      gvx.MountVolume,
-			ImagePath: filepath.Join(p.stateDir, "buildkit.ext4"),
-			GuestPath: "/var/lib/buildkit",
-		}},
-		Argv:      []string{"buildkitd", "--addr", fmt.Sprintf("tcp://0.0.0.0:%d", buildKitGuestPort)},
-		Resources: gvx.Resources{MemoryBytes: 4 << 30},
-		Name:      "gvx-docker-buildkit",
-	}
-	// An optional buildkitd.toml in the state directory configures the
-	// builder, as --buildkitd-config does for the docker-container driver:
-	// for example, registry mirrors or a plain HTTP registry.
-	if conf := filepath.Join(p.stateDir, "buildkitd.toml"); fileExists(conf) {
-		cfg.Mounts = append(cfg.Mounts, gvx.Mount{Kind: gvx.MountBind, HostPath: conf, GuestPath: "/etc/buildkit/buildkitd.toml", ReadOnly: true})
-		cfg.Argv = append(cfg.Argv, "--config", "/etc/buildkit/buildkitd.toml")
-	}
+	cfg := buildKitConfig(p, stderr)
 	sb, err := gvx.New(ctx, cfg)
 	if err != nil {
 		return 0, fmt.Errorf("start BuildKit sandbox: %w", err)
@@ -250,4 +225,46 @@ func waitForSocket(ctx context.Context, path string, timeout time.Duration) erro
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+// buildKitConfig returns the sandbox config of the BuildKit builder.
+func buildKitConfig(p paths, stderr io.Writer) gvx.Config {
+	cfg := gvx.Config{
+		Platform:    gvx.PlatformAuto,
+		NetworkMode: gvx.NetModeNAT,
+		// RUN steps share this network. With the flag, a build reaches
+		// the services on the loopback of the Mac, such as a registry that
+		// publishes its port there; any Dockerfile then reaches them too.
+		LoopbackToHost:         p.builderHostLoopback,
+		NetRaw:                 true,
+		AllowPacketSocketWrite: true,
+		AllowSUID:              true,
+		OCIImage:               p.buildkitImage,
+		PullPolicy:             gvx.PullMissing,
+		Warnings:               stderr,
+		Stdin:                  nil,
+		Stdout:                 stderr,
+		Stderr:                 stderr,
+		PortForwards: []gvx.PortForward{{
+			GuestPort:  buildKitGuestPort,
+			Protocol:   "tcp",
+			HostSocket: p.backendSock,
+		}},
+		Mounts: []gvx.Mount{{
+			Kind:      gvx.MountVolume,
+			ImagePath: filepath.Join(p.stateDir, "buildkit.ext4"),
+			GuestPath: "/var/lib/buildkit",
+		}},
+		Argv:      []string{"buildkitd", "--addr", fmt.Sprintf("tcp://0.0.0.0:%d", buildKitGuestPort)},
+		Resources: gvx.Resources{MemoryBytes: 4 << 30},
+		Name:      "gvx-docker-buildkit",
+	}
+	// An optional buildkitd.toml in the state directory configures the
+	// builder, as --buildkitd-config does for the docker-container driver:
+	// for example, registry mirrors or a plain HTTP registry.
+	if conf := filepath.Join(p.stateDir, "buildkitd.toml"); fileExists(conf) {
+		cfg.Mounts = append(cfg.Mounts, gvx.Mount{Kind: gvx.MountBind, HostPath: conf, GuestPath: "/etc/buildkit/buildkitd.toml", ReadOnly: true})
+		cfg.Argv = append(cfg.Argv, "--config", "/etc/buildkit/buildkitd.toml")
+	}
+	return cfg
 }

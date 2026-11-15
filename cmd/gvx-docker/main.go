@@ -76,18 +76,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Usage:")
-	_, _ = fmt.Fprintln(w, "  gvx-docker serve [-socket PATH] [-state-dir DIR]")
+	_, _ = fmt.Fprintln(w, "  gvx-docker serve [-socket PATH] [-state-dir DIR] [-builder-host-loopback]")
 	_, _ = fmt.Fprintln(w, "  gvx-docker builder [-state-dir DIR]")
 	_, _ = fmt.Fprintln(w, "  gvx-docker setup [-socket PATH] [-state-dir DIR]")
 	_, _ = fmt.Fprintln(w, "  gvx-docker setup -remove [-state-dir DIR]")
 }
 
 type paths struct {
-	stateDir      string
-	apiSocket     string
-	buildkitSock  string
-	backendSock   string
-	buildkitImage string
+	// builderHostLoopback lets RUN steps of builds reach the loopback of the
+	// host. See addBuilderFlags.
+	builderHostLoopback bool
+	stateDir            string
+	apiSocket           string
+	buildkitSock        string
+	backendSock         string
+	buildkitImage       string
 }
 
 func defaultPaths() (paths, error) {
@@ -109,6 +112,12 @@ func addPathFlags(fs *flag.FlagSet, p *paths) {
 	fs.StringVar(&p.buildkitImage, "buildkit-image", p.buildkitImage, "BuildKit image")
 }
 
+// addBuilderFlags adds the flags that serve passes on to the builder.
+func addBuilderFlags(fs *flag.FlagSet, p *paths) {
+	fs.BoolVar(&p.builderHostLoopback, "builder-host-loopback", false,
+		"Let RUN steps of builds reach services on 127.0.0.1 of the host, such as a local registry. Any Dockerfile can then reach them. Without it, use host.docker.internal")
+}
+
 func (p *paths) normalize() {
 	p.stateDir = filepath.Clean(p.stateDir)
 	p.buildkitSock = filepath.Join(p.stateDir, "run", "buildkit.sock")
@@ -124,6 +133,7 @@ func serveCommand(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gvx-docker serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addPathFlags(fs, &p)
+	addBuilderFlags(fs, &p)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -182,6 +192,7 @@ func builderCommand(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gvx-docker builder", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addPathFlags(fs, &p)
+	addBuilderFlags(fs, &p)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
