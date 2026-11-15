@@ -228,3 +228,71 @@ func TestControlCallsTimeOutOnASilentShim(t *testing.T) {
 		}
 	}
 }
+
+// TestClosedSessionsReleaseTheirSockets opens and closes many dial sessions,
+// as a client that makes short connections to another container does. The
+// supervisor must close its end of each session when the shim closes its
+// end. A leaked end per session used up the descriptor limit of the
+// supervisor, and later dials failed with "connection refused".
+func TestClosedSessionsReleaseTheirSockets(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gvx-net-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	store := newContainerStore(dir)
+	app := containerRecord{ID: strings.Repeat("1", 64), Name: "app", Created: time.Now(), State: containerState{Running: true, Status: "running"},
+		Networks: map[string]endpointSettings{"n": {NetworkID: "n1", IPAddress: "172.20.0.2", Subnet: "172.20.0.0/16"}}}
+	if err := store.create(app); err != nil {
+		t.Fatal(err)
+	}
+	supervisorEnd, shimEnd, err := socketPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go serveNetworkConn(ctx, supervisorEnd, dir, store, app.ID)
+	shimConn, err := fileUnixConn(shimEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &netClient{conn: shimConn}
+
+	before := openDescriptors(t)
+	const sessions = 300
+	for i := 0; i < sessions; i++ {
+		s, err := client.session()
+		if err != nil {
+			t.Fatalf("session %d: %v", i, err)
+		}
+		_ = s.conn.Close()
+	}
+	// The supervisor closes its end when it reads EOF; give its goroutines
+	// a moment to run.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		leaked := openDescriptors(t) - before
+		if leaked < sessions/10 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d descriptors stay open after %d closed sessions", leaked, sessions)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// openDescriptors counts the open descriptors of this process.
+func openDescriptors(t *testing.T) int {
+	t.Helper()
+	dir := "/dev/fd"
+	if _, err := os.Stat("/proc/self/fd"); err == nil {
+		dir = "/proc/self/fd"
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
