@@ -683,6 +683,38 @@ func decompressMaybe(r io.Reader) io.Reader {
 }
 
 // applyChange applies one Dockerfile instruction of docker import --change.
+// stringList returns v as a list of strings. A config that commit decodes
+// from JSON holds []any, and a change applied before holds []string.
+func stringList(v any) []string {
+	switch list := v.(type) {
+	case []string:
+		return list
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// setEnv sets the variable key in env to value, in place of an entry with
+// the same key, as ENV in a Dockerfile does.
+func setEnv(env []string, key, value string) []string {
+	entry := key + "=" + value
+	for i, e := range env {
+		if name, _, _ := strings.Cut(e, "="); name == key {
+			out := append([]string(nil), env...)
+			out[i] = entry
+			return out
+		}
+	}
+	return append(append([]string(nil), env...), entry)
+}
+
 func applyChange(cfg map[string]any, change string) {
 	instr, arg, _ := strings.Cut(strings.TrimSpace(change), " ")
 	arg = strings.TrimSpace(arg)
@@ -707,8 +739,7 @@ func applyChange(cfg map[string]any, change string) {
 		if !ok {
 			k, v, _ = strings.Cut(arg, " ")
 		}
-		env, _ := cfg["Env"].([]string)
-		cfg["Env"] = append(env, strings.TrimSpace(k)+"="+strings.TrimSpace(v))
+		cfg["Env"] = setEnv(stringList(cfg["Env"]), strings.TrimSpace(k), strings.TrimSpace(v))
 	case "EXPOSE":
 		ports, _ := cfg["ExposedPorts"].(map[string]any)
 		if ports == nil {
