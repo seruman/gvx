@@ -189,6 +189,15 @@ func (m *idleShims) lockStart(id string) func() {
 	return l.Unlock
 }
 
+// forget drops the start lock of container id, after the container is gone.
+// A start that holds the lock keeps its own reference, so dropping the entry
+// cannot break it; a later request for the same ID gets a new lock.
+func (m *idleShims) forget(id string) {
+	m.mu.Lock()
+	delete(m.starts, id)
+	m.mu.Unlock()
+}
+
 // acquire returns the control socket of the idle sandbox of rec, and starts
 // the sandbox when none runs. A sandbox that stops is waited for first, so
 // two sandboxes never hold the root image at once. The release function ends

@@ -964,6 +964,7 @@ func (s *server) removeContainer(w http.ResponseWriter, r *http.Request, ref str
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.idleShims.forget(rec.ID)
 	if v := r.URL.Query().Get("v"); v == "1" || v == "true" {
 		if err := s.containers.removeAnonymousVolumes(rec, s.volumeRoot()); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
