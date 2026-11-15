@@ -422,6 +422,32 @@ func (s *containerStore) get(ref string) (containerRecord, error) {
 	return s.findLocked(ref)
 }
 
+// renameLocked gives container id the name, under the store lock, and fails
+// with errConflict when another container has it.
+func (s *containerStore) renameLocked(id, name string) (containerRecord, error) {
+	unlock, err := s.lockAll()
+	if err != nil {
+		return containerRecord{}, err
+	}
+	defer unlock()
+	inUse, err := s.nameInUseLocked(name, id)
+	if err != nil {
+		return containerRecord{}, err
+	}
+	if inUse {
+		return containerRecord{}, fmt.Errorf("%w: Conflict. The container name %q is already in use", errConflict, "/"+name)
+	}
+	rec, err := s.readLocked(id)
+	if err != nil {
+		return containerRecord{}, fmt.Errorf("%w: No such container: %s", errNotFound, id)
+	}
+	rec.Name = name
+	if err := writeJSONFile(s.configPath(rec.ID), rec); err != nil {
+		return rec, err
+	}
+	return rec, nil
+}
+
 // nameInUseLocked reports whether a container other than exceptID has the
 // name. Only an equal name counts: a name that matches the start of an ID,
 // such as "cafe", is a valid name. The caller holds the store lock.

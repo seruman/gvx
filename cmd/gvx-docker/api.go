@@ -95,6 +95,9 @@ type server struct {
 	arch       string
 	// idleShims holds the idle sandboxes of stopped containers for copies.
 	idleShims idleShims
+	// beforeRename runs in rename between the name check and the update.
+	// Tests use it to make two renames overlap.
+	beforeRename func()
 	// attachDone runs when an attach stream ends. Tests use it.
 	attachDone func()
 	// logEOFHook runs in the log follower after a read reaches the end of

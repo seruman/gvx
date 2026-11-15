@@ -135,3 +135,39 @@ func TestCreateAcceptsANameThatIsAnIDPrefix(t *testing.T) {
 		t.Fatal("create of a name in use succeeded")
 	}
 }
+
+// TestParallelRenamesToOneNameConflict renames two containers to one name at
+// once. One rename must fail with 409, so no two containers share a name.
+func TestParallelRenamesToOneNameConflict(t *testing.T) {
+	state := t.TempDir()
+	s := &server{containers: newContainerStore(state), networks: newNetworkStore(state), stateDir: state}
+	for i, name := range []string{"first", "second"} {
+		id := strings.Repeat(string(rune('a'+i)), 64)
+		if err := s.containers.create(containerRecord{ID: id, Name: name, Created: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.beforeRename = func() { time.Sleep(100 * time.Millisecond) }
+	codes := make(chan int, 2)
+	for _, name := range []string{"first", "second"} {
+		go func(name string) {
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/containers/"+name+"/rename?name=shared", nil))
+			codes <- rec.Code
+		}(name)
+	}
+	got := []int{<-codes, <-codes}
+	records, err := s.containers.list()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := 0
+	for _, r := range records {
+		if r.Name == "shared" {
+			shared++
+		}
+	}
+	if shared != 1 {
+		t.Fatalf("%d containers have the name shared after two parallel renames (codes %v), want 1", shared, got)
+	}
+}
