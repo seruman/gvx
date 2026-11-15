@@ -25,6 +25,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -51,14 +52,34 @@ func vdsoParamPage() uintptr {
 }
 
 func main() {
-	// The timekeeper writes the page within a second of the first task.
-	time.Sleep(1500 * time.Millisecond)
-	ready := uint64(0)
+	// With the argument "wait", the probe prints "waiting" and reads one
+	// line of stdin before it measures. A checkpoint test stops the guest
+	// there, so the measurement runs in the restored guest.
+	if len(os.Args) > 1 && os.Args[1] == "wait" {
+		fmt.Println("waiting")
+		if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+			fmt.Fprintln(os.Stderr, "read stdin:", err)
+			os.Exit(1)
+		}
+	}
+	// The timekeeper writes the page within a second of the first task. A
+	// restored timekeeper calibrates again, and its time settles within
+	// about 2 seconds (see TestRestoredGuestReadsTheClockThroughTheVDSO).
+	settle := 1500 * time.Millisecond
+	if len(os.Args) > 1 && os.Args[1] == "wait" {
+		settle = 3 * time.Second
+	}
+	time.Sleep(settle)
+	ready, realtimeReady := uint64(0), uint64(0)
 	if p := vdsoParamPage(); p != 0 {
-		// The page starts with the sequence counter, then monotonicReady.
+		// The page holds the sequence counter, then four words of the
+		// monotonic clock, then four words of the realtime clock. Each
+		// group starts with its ready flag.
 		ready = *(*uint64)(unsafe.Pointer(p + 8))
+		realtimeReady = *(*uint64)(unsafe.Pointer(p + 40))
 	}
 	fmt.Printf("vdso_ready=%d\n", ready)
+	fmt.Printf("vdso_realtime_ready=%d\n", realtimeReady)
 
 	const n = 100000
 	prev := time.Now()
