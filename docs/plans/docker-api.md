@@ -84,6 +84,7 @@ A container gets one address on each of its networks. The guest keeps its NAT ad
 | Engine lock | `~/.gvx/docker/serve.lock` | Held by the live `serve`. |
 | Shim control socket | `~/.gvx/docker/run/<id12>.sock` | Exists while the container runs. |
 | Named volumes | `~/.gvx/docker/volumes/<name>/_data` | Host directories, so several containers share them. Removed by `docker volume rm` or `docker volume prune`. |
+| Anonymous volumes | `~/.gvx/docker/volumes/<id>/_data`, with the label `com.docker.volume.anonymous` | Made by `create` for each image `VOLUME` and each volume mount without a name. Removed with the last container that mounts them by `docker rm -v`, `--rm`, or `docker container prune`. A volume from a build before the label has no label, so `docker rm -v` keeps it; `docker volume prune` removes it. |
 | Networks | `~/.gvx/docker/networks/<id>.json` | Removed by `docker network rm`. |
 | Registry credentials | `~/.docker/config.json` and credential helpers | Not copied. |
 
