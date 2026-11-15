@@ -398,7 +398,7 @@ func runShimProcess(ctx context.Context, exe string, p paths, store *containerSt
 		cmd.Args = []string{exe, "shim", "-life-fd", "3", "-net-fd", "4", "-state-dir", p.stateDir, id}
 		netCtx, stopNet := context.WithCancel(context.Background())
 		defer stopNet()
-		go serveNetworkConn(netCtx, netConn, p.stateDir, store, id)
+		go serveNetworkConn(netCtx, netConn, p.stateDir, newNetworkView(store), id)
 	}
 	setParentDeathSignal(cmd)
 	startErr := cmd.Start()
