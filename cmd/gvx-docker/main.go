@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -212,36 +213,52 @@ func setupCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	p.normalize()
 	if *remove {
-		if err := removeDockerSetup(ctx, p, stdout, stderr); err != nil {
+		if err := removeDockerSetup(ctx, p, runDocker, stdout, stderr); err != nil {
 			_, _ = fmt.Fprintf(stderr, "gvx-docker setup -remove: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	if err := setupDocker(ctx, p, stdout, stderr); err != nil {
+	if err := setupDocker(ctx, p, runDocker, stdout, stderr); err != nil {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker setup: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func setupDocker(ctx context.Context, p paths, stdout, stderr io.Writer) error {
+// dockerCLI runs the docker command with args. Tests replace it.
+type dockerCLI func(ctx context.Context, stdout, stderr io.Writer, args ...string) error
+
+func setupDocker(ctx context.Context, p paths, cli dockerCLI, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	contextHost := "host=unix://" + p.apiSocket
-	if err := runDocker(ctx, stdout, stderr, "context", "inspect", contextName); err != nil {
-		if err := runDocker(ctx, stdout, stderr, "context", "create", contextName, "--docker", contextHost); err != nil {
+	rec := readSetupRecord(p.stateDir)
+	var oldHost bytes.Buffer
+	if err := cli(ctx, &oldHost, io.Discard, "context", "inspect", contextName, "--format", "{{.Endpoints.docker.Host}}"); err != nil {
+		if err := cli(ctx, stdout, stderr, "context", "create", contextName, "--docker", contextHost); err != nil {
 			return err
 		}
-	} else if err := runDocker(ctx, stdout, stderr, "context", "update", contextName, "--docker", contextHost); err != nil {
+		rec.ContextCreated, rec.ContextOldHost = true, ""
+	} else {
+		// The context exists. A context that an earlier setup created or
+		// updated keeps its record; one of the user records its endpoint.
+		if !rec.ownsContext() {
+			rec.ContextOldHost = strings.TrimSpace(oldHost.String())
+		}
+		if err := cli(ctx, stdout, stderr, "context", "update", contextName, "--docker", contextHost); err != nil {
+			return err
+		}
+	}
+	if err := saveSetupRecord(p.stateDir, rec); err != nil {
 		return err
 	}
 	builderEndpoint := "unix://" + p.buildkitSock
-	_ = runDocker(ctx, io.Discard, io.Discard, "buildx", "rm", builderName)
-	if err := runDocker(ctx, stdout, stderr, "buildx", "create", "--name", builderName, "--driver", "remote", "--driver-opt", "default-load=true", builderEndpoint); err != nil {
+	_ = cli(ctx, io.Discard, io.Discard, "buildx", "rm", builderName)
+	if err := cli(ctx, stdout, stderr, "buildx", "create", "--name", builderName, "--driver", "remote", "--driver-opt", "default-load=true", builderEndpoint); err != nil {
 		return err
 	}
-	if err := runDocker(ctx, stdout, stderr, "--context", contextName, "buildx", "use", "--default", builderName); err != nil {
+	if err := cli(ctx, stdout, stderr, "--context", contextName, "buildx", "use", "--default", builderName); err != nil {
 		return err
 	}
 	// docker build uses the builder that has the name of the context, and
@@ -253,36 +270,65 @@ func setupDocker(ctx context.Context, p paths, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return writeBuilderAliases(dockerDir, p.stateDir, stderr)
+	return writeBuilderAliases(dockerDir, p.stateDir, builderEndpoint, stderr)
 }
 
 // removeDockerSetup undoes setupDocker: it deletes the alias files that setup
-// wrote, the gvx builder, and the gvx context. A context or builder that is
-// gone already is not an error.
-func removeDockerSetup(ctx context.Context, p paths, stdout, stderr io.Writer) error {
+// wrote and the gvx builder, and it deletes the gvx context that setup
+// created or restores the endpoint of a gvx context of the user.
+func removeDockerSetup(ctx context.Context, p paths, cli dockerCLI, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	dockerDir, err := dockerConfigDir()
 	if err != nil {
 		return err
 	}
-	if err := removeBuilderAliases(dockerDir, p.stateDir, stderr); err != nil {
+	rec := readSetupRecord(p.stateDir)
+	if err := removeBuilderAliases(dockerDir, rec); err != nil {
 		return err
 	}
-	_ = runDocker(ctx, io.Discard, io.Discard, "buildx", "rm", builderName)
-	_ = runDocker(ctx, io.Discard, io.Discard, "context", "rm", "--force", contextName)
-	_, _ = fmt.Fprintln(stdout, "gvx-docker setup: removed the gvx context, the gvx-buildkit builder, and the aliases that setup wrote")
+	_ = cli(ctx, io.Discard, io.Discard, "buildx", "rm", builderName)
+	switch {
+	case rec.ContextCreated:
+		_ = cli(ctx, io.Discard, io.Discard, "context", "rm", "--force", contextName)
+	case rec.ContextOldHost != "":
+		if err := cli(ctx, io.Discard, stderr, "context", "update", contextName, "--docker", "host="+rec.ContextOldHost); err != nil {
+			return fmt.Errorf("restore the endpoint of the context %s: %w", contextName, err)
+		}
+	default:
+		// A setup before the record left no note. Delete the context only
+		// when it still points at this engine.
+		var host bytes.Buffer
+		if cli(ctx, &host, io.Discard, "context", "inspect", contextName, "--format", "{{.Endpoints.docker.Host}}") == nil && strings.TrimSpace(host.String()) == "unix://"+p.apiSocket {
+			_ = cli(ctx, io.Discard, io.Discard, "context", "rm", "--force", contextName)
+		}
+	}
+	if err := os.Remove(setupRecordPath(p.stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, "gvx-docker setup: removed the gvx builder and the aliases that setup wrote, and undid its change to the gvx context")
 	return nil
 }
 
 // writeBuilderAlias copies the instance file of builderName to an instance
 // file with the given name.
-// setupRecord lists the files that setup wrote, so setup -remove deletes
-// those files and no file of the user.
+// writeAliasFile writes an alias file. Tests replace it to make a write
+// fail.
+var writeAliasFile = os.WriteFile
+
+// setupRecord lists what setup changed, so setup -remove undoes that and
+// touches nothing of the user.
 type setupRecord struct {
 	// Aliases lists the buildx instance files that setup wrote.
 	Aliases []string `json:"Aliases"`
+	// ContextCreated reports that setup created the gvx context.
+	ContextCreated bool `json:"ContextCreated,omitempty"`
+	// ContextOldHost is the Docker endpoint of a gvx context of the user
+	// that setup pointed at this engine. setup -remove restores it.
+	ContextOldHost string `json:"ContextOldHost,omitempty"`
 }
+
+func (r setupRecord) ownsContext() bool { return r.ContextCreated || r.ContextOldHost != "" }
 
 func setupRecordPath(stateDir string) string { return filepath.Join(stateDir, "setup.json") }
 
@@ -290,6 +336,16 @@ func readSetupRecord(stateDir string) setupRecord {
 	var rec setupRecord
 	_ = readJSONFile(setupRecordPath(stateDir), &rec)
 	return rec
+}
+
+// saveSetupRecord writes rec at once, so a failure after one change cannot
+// leave a change without a record, which a later setup would take for the
+// user's.
+func saveSetupRecord(stateDir string, rec setupRecord) error {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	return writeJSONFile(setupRecordPath(stateDir), rec)
 }
 
 // dockerConfigDir returns the Docker config directory: DOCKER_CONFIG, then
@@ -305,49 +361,67 @@ func dockerConfigDir() (string, error) {
 	return filepath.Join(home, ".docker"), nil
 }
 
+// isGvxAlias reports whether the instance file at path is an alias that a
+// setup wrote: a remote builder whose node is the BuildKit socket of this
+// engine. Setups before the record wrote such files without a record.
+func isGvxAlias(path, buildkitEndpoint string) bool {
+	var inst struct {
+		Driver string
+		Nodes  []struct{ Endpoint string }
+	}
+	if err := readJSONFile(path, &inst); err != nil || inst.Driver != "remote" {
+		return false
+	}
+	for _, n := range inst.Nodes {
+		if n.Endpoint == buildkitEndpoint {
+			return true
+		}
+	}
+	return false
+}
+
 // writeBuilderAliases writes the buildx instances that docker build and
 // docker compose build use, as copies of the gvx builder. It writes an alias
-// only when no instance of that name exists, or when an earlier setup wrote
-// it, and records the files that it owns in the state directory.
-func writeBuilderAliases(dockerDir, stateDir string, stderr io.Writer) error {
+// only when no instance of that name exists, or when a setup wrote it, and
+// records each alias right after it writes it.
+func writeBuilderAliases(dockerDir, stateDir, buildkitEndpoint string, stderr io.Writer) error {
+	rec := readSetupRecord(stateDir)
 	owned := map[string]bool{}
-	for _, name := range readSetupRecord(stateDir).Aliases {
+	for _, name := range rec.Aliases {
 		owned[name] = true
 	}
 	instances := filepath.Join(dockerDir, "buildx", "instances")
-	var rec setupRecord
+	rec.Aliases = nil
 	for _, name := range []string{contextName, "default"} {
 		path := filepath.Join(instances, name)
-		if _, err := os.Lstat(path); err == nil && !owned[name] {
+		if _, err := os.Lstat(path); err == nil && !owned[name] && !isGvxAlias(path, buildkitEndpoint) {
 			_, _ = fmt.Fprintf(stderr, "gvx-docker setup: keep the buildx instance %q of the user; builds that use it do not go to gvx\n", name)
 			continue
 		}
 		if err := writeBuilderAlias(instances, name); err != nil {
+			// Keep the aliases that are written already in the record.
+			_ = saveSetupRecord(stateDir, rec)
 			return err
 		}
 		rec.Aliases = append(rec.Aliases, name)
+		if err := saveSetupRecord(stateDir, rec); err != nil {
+			return err
+		}
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return err
-	}
-	return writeJSONFile(setupRecordPath(stateDir), rec)
+	return nil
 }
 
-// removeBuilderAliases deletes the buildx instance files that setup recorded,
-// and the record.
-func removeBuilderAliases(dockerDir, stateDir string, stderr io.Writer) error {
+// removeBuilderAliases deletes the buildx instance files that setup recorded.
+func removeBuilderAliases(dockerDir string, rec setupRecord) error {
 	instances := filepath.Join(dockerDir, "buildx", "instances")
 	var errs []error
-	for _, name := range readSetupRecord(stateDir).Aliases {
+	for _, name := range rec.Aliases {
 		if name != contextName && name != "default" {
 			continue
 		}
 		if err := os.Remove(filepath.Join(instances, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
-	}
-	if err := os.Remove(setupRecordPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
@@ -373,7 +447,7 @@ func writeBuilderAlias(instances, alias string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(instances, alias), out, 0o600)
+	return writeAliasFile(filepath.Join(instances, alias), out, 0o600)
 }
 
 func runDocker(ctx context.Context, stdout, stderr io.Writer, args ...string) error {
