@@ -1009,6 +1009,9 @@ type logOptions struct {
 	// runAfter makes a follower ignore an exit of a run that started at or
 	// before this time. It waits for a later run and follows it to its exit.
 	runAfter time.Time
+	// runDeadline ends the wait for a run after runAfter when no run has
+	// started by then. Zero means no bound.
+	runDeadline time.Time
 	// since and until bound the entries by time. Zero means no bound.
 	since, until time.Time
 }
@@ -1110,6 +1113,9 @@ func (s *server) streamLogs(ctx context.Context, w io.Writer, rec containerRecor
 			}
 			current, getErr := s.containers.get(rec.ID)
 			staleExit := getErr == nil && !opts.runAfter.IsZero() && !current.State.StartedAt.After(opts.runAfter)
+			if staleExit && !opts.runDeadline.IsZero() && time.Now().After(opts.runDeadline) {
+				return
+			}
 			if getErr != nil || (current.State.Status == "exited" && !staleExit) {
 				// The container can write its last lines after the read
 				// above and before its exit. Read the rest once more.
@@ -1287,11 +1293,21 @@ func (s *server) attachContainer(w http.ResponseWriter, r *http.Request, ref str
 	// start -a attaches before it starts the container. The follower must
 	// not end on the exit that comes before the attach.
 	followAfter := time.Time{}
+	runDeadline := time.Time{}
 	if !rec.State.Running && !rec.State.Restarting && rec.State.Status == "exited" {
 		followAfter = rec.State.StartedAt
 		if followAfter.IsZero() {
 			followAfter = time.Unix(0, 1)
 		}
+		// A read cannot tell a client that left from docker start -a, which
+		// closes its write side and then sends start. Bound the wait for the
+		// next run instead, as the input path does, so a client whose start
+		// failed does not hold the stream open.
+		wait := s.attachRunWait
+		if wait <= 0 {
+			wait = 60 * time.Second
+		}
+		runDeadline = time.Now().Add(wait)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1307,7 +1323,7 @@ func (s *server) attachContainer(w http.ResponseWriter, r *http.Request, ref str
 	// A write to a client that left fails. End the follower then: a read
 	// cannot tell a closed client from one that closed only its input.
 	out := &cancelOnWriteError{w: conn, cancel: cancel}
-	s.streamLogs(ctx, out, rec, logOptions{stdout: stdout, stderr: stderr, follow: true, tail: tail, raw: rec.Config.Tty, startAtEnd: tail == 0, runAfter: followAfter})
+	s.streamLogs(ctx, out, rec, logOptions{stdout: stdout, stderr: stderr, follow: true, tail: tail, raw: rec.Config.Tty, startAtEnd: tail == 0, runAfter: followAfter, runDeadline: runDeadline})
 	if s.attachDone != nil {
 		s.attachDone()
 	}

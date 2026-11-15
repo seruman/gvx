@@ -333,3 +333,34 @@ func TestStartAttachOfAnExitedContainerForwardsInput(t *testing.T) {
 		t.Fatal("the input of the client never reached the next run")
 	}
 }
+
+// TestAttachThatWaitsForARunEndsWhenTheClientLeaves attaches to an exited
+// container, as docker start -a does, and the client leaves before any run
+// starts, as when the start fails. The follower must end, and not hold the
+// connection and the log until the container runs again.
+func TestAttachThatWaitsForARunEndsWhenTheClientLeaves(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{containers: newContainerStore(dir), networks: newNetworkStore(dir), stateDir: dir, attachRunWait: time.Second}
+	id := strings.Repeat("9", 64)
+	exitedContainer(t, s, id)
+	followerDone := make(chan struct{})
+	s.attachDone = func() { close(followerDone) }
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(conn, "POST /containers/%s/attach?stream=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", id)
+	br := bufio.NewReader(conn)
+	if status, _ := br.ReadString('\n'); !strings.Contains(status, "101") {
+		t.Fatalf("attach answered %q", status)
+	}
+	time.Sleep(200 * time.Millisecond)
+	_ = conn.Close()
+	select {
+	case <-followerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("an attach that waits for the next run kept running after its client left")
+	}
+}
