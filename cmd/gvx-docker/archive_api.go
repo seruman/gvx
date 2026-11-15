@@ -167,6 +167,10 @@ type idleShim struct {
 	stop     func()
 	// done closes when the sandbox process ended.
 	done chan struct{}
+	// stopped closes after the stop of the sandbox returned, which is after
+	// the removal of its socket. A new sandbox on the same socket path waits
+	// for it, so the old stop cannot remove the socket of the new one.
+	stopped chan struct{}
 }
 
 // lockStart takes the start lock of container id and returns its unlock.
@@ -200,7 +204,7 @@ func (m *idleShims) acquire(ctx context.Context, s *server, rec containerRecord)
 		if ok && cur.stopping {
 			m.mu.Unlock()
 			select {
-			case <-cur.done:
+			case <-cur.stopped:
 				m.mu.Lock()
 				if m.shims[rec.ID] == cur {
 					delete(m.shims, rec.ID)
@@ -212,7 +216,7 @@ func (m *idleShims) acquire(ctx context.Context, s *server, rec containerRecord)
 			}
 		}
 		if !ok {
-			cur = &idleShim{ready: make(chan struct{}), done: make(chan struct{})}
+			cur = &idleShim{ready: make(chan struct{}), done: make(chan struct{}), stopped: make(chan struct{})}
 			m.shims[rec.ID] = cur
 			go func(sh *idleShim) {
 				sh.sock, sh.stop, sh.err = s.startIdleShim(context.Background(), rec, sh.done)
@@ -262,6 +266,7 @@ func (m *idleShims) release(id string, sh *idleShim) {
 		delete(m.shims, id)
 	}
 	m.mu.Unlock()
+	close(sh.stopped)
 }
 
 // waitIdle returns after the idle sandbox of container id, if one runs or
@@ -307,6 +312,9 @@ func (s *server) startIdleShim(ctx context.Context, rec containerRecord, done ch
 		case <-time.After(10 * time.Second):
 			_ = cmd.Process.Kill()
 			<-done
+		}
+		if s.beforeIdleSocketRemove != nil {
+			s.beforeIdleSocketRemove()
 		}
 		_ = os.Remove(sock)
 	}

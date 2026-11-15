@@ -98,6 +98,9 @@ type server struct {
 	// beforeRename runs in rename between the name check and the update.
 	// Tests use it to make two renames overlap.
 	beforeRename func()
+	// beforeIdleSocketRemove runs in the stop of an idle sandbox after its
+	// process ended and before the removal of its socket. Tests use it.
+	beforeIdleSocketRemove func()
 	// attachRunWait bounds the wait of an attach to an exited container for
 	// its next run. Zero selects 60 seconds.
 	attachRunWait time.Duration
