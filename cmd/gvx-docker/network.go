@@ -345,8 +345,12 @@ type netResponse struct {
 // shared connection waits for a dial.
 
 func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, store *containerStore, id string) {
-	go func() {
-		<-ctx.Done()
+	// The connection closes when the shim closes its end or the run ends.
+	// A dial session lives for one request, so a short connection to
+	// another container would leak one socket otherwise.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer func() {
+		stop()
 		_ = conn.Close()
 	}()
 	reader := bufio.NewReader(conn)
