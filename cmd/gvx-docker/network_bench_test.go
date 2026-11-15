@@ -53,9 +53,10 @@ func BenchmarkAnswerResolve(b *testing.B) {
 				}
 			}
 			req := netRequest{Op: "resolve", Name: fmt.Sprintf("svc%d", n-1)}
+			view := newNetworkView(store)
 			b.ResetTimer()
 			for range b.N {
-				resp, _ := answerNetwork(context.Background(), dir, store, self.ID, req)
+				resp, _ := answerNetworkIn(context.Background(), dir, view, self.ID, req)
 				if !resp.Found {
 					b.Fatal("not found")
 				}

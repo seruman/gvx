@@ -345,7 +345,7 @@ type netResponse struct {
 // connection, and passes the other end with SCM_RIGHTS. No request on the
 // shared connection waits for a dial.
 
-func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, store *containerStore, id string) {
+func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, view *networkView, id string) {
 	// The connection closes when the shim closes its end or the run ends.
 	// A dial session lives for one request, so a short connection to
 	// another container would leak one socket otherwise.
@@ -364,7 +364,7 @@ func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, 
 		if json.Unmarshal(line, &req) != nil {
 			return
 		}
-		resp, file := answerNetwork(ctx, stateDir, store, id, req)
+		resp, file := answerNetworkIn(ctx, stateDir, view, id, req)
 		data, _ := json.Marshal(resp)
 		data = append(data, '\n')
 		if file != nil {
@@ -379,10 +379,10 @@ func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, 
 	}
 }
 
-func answerNetwork(ctx context.Context, stateDir string, store *containerStore, id string, req netRequest) (netResponse, *os.File) {
-	// One scan of the store serves the request. store.get lists every
-	// container too, so a lookup that called both read each record twice.
-	all, err := store.list()
+func answerNetworkIn(ctx context.Context, stateDir string, view *networkView, id string, req netRequest) (netResponse, *os.File) {
+	// One read of the view serves the request. The view decodes only the
+	// store files that changed since the last request of this supervisor.
+	all, err := view.list()
 	if err != nil {
 		return netResponse{}, nil
 	}
@@ -427,7 +427,7 @@ func answerNetwork(ctx context.Context, stateDir string, store *containerStore, 
 			return netResponse{Error: err.Error()}, nil
 		}
 		syscall.CloseOnExec(int(child.Fd()))
-		go serveNetworkConn(ctx, conn, stateDir, store, id)
+		go serveNetworkConn(ctx, conn, stateDir, view, id)
 		return netResponse{Found: true}, child
 	case "dial":
 		target, ok := routeAddress(self, all, req.Addr)

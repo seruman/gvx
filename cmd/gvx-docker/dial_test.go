@@ -136,7 +136,7 @@ func TestSlowDialDoesNotBlockNameLookups(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go serveNetworkConn(ctx, supervisorEnd, dir, store, app.ID)
+	go serveNetworkConn(ctx, supervisorEnd, dir, newNetworkView(store), app.ID)
 	shimConn, err := fileUnixConn(shimEnd)
 	if err != nil {
 		t.Fatal(err)
@@ -252,7 +252,7 @@ func TestClosedSessionsReleaseTheirSockets(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go serveNetworkConn(ctx, supervisorEnd, dir, store, app.ID)
+	go serveNetworkConn(ctx, supervisorEnd, dir, newNetworkView(store), app.ID)
 	shimConn, err := fileUnixConn(shimEnd)
 	if err != nil {
 		t.Fatal(err)
