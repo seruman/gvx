@@ -80,13 +80,14 @@ A container gets one address on each of its networks. The guest keeps its NAT ad
 | Container writable layer | `~/.gvx/docker/containers/<id>/rootfs.ext4` | Survives stop and start. Removed by `docker rm`. |
 | Container logs | `~/.gvx/docker/containers/<id>/log.json` | Rotated at a size limit. Removed by `docker rm`. |
 | Supervisor log | `~/.gvx/docker/containers/<id>/supervisor.log` | Each run and its exit code, restarts, and the errors of the supervisor and of the shim before the guest starts. Removed by `docker rm`. |
-| Engine log | `~/.gvx/docker/engine.log` | One line for each API request with the method, the path, the status, and the error text, plus the output of `serve` and of the builder. `serve` also writes it to stderr. Headers and query strings stay out of it. `serve` moves a log larger than 10 MB to `engine.log.1` at start. |
+| Engine log | `~/.gvx/docker/engine.log` | One line for each API request with the method, the path, the status, and the error text, plus the output of `serve` and of the builder. `serve` also writes it to stderr. Headers and query strings stay out of it. The log moves to `engine.log.1` when it passes 10 MB, also while `serve` runs; one old file stays. |
 | Setup record | `~/.gvx/docker/setup.json` | Lists the Buildx instance files that `setup` wrote. Removed by `setup -remove`. |
 | Supervisor lock | `~/.gvx/docker/containers/<id>/supervisor.lock` | Held by the live supervisor. Removed by `docker rm`. |
 | Engine lock | `~/.gvx/docker/serve.lock` | Held by the live `serve`. |
 | Shim control socket | `~/.gvx/docker/run/<id12>.sock` | Exists while the container runs. |
 | Named volumes | `~/.gvx/docker/volumes/<name>/_data` | Host directories, so several containers share them. Removed by `docker volume rm` or `docker volume prune`. |
 | Anonymous volumes | `~/.gvx/docker/volumes/<id>/_data`, with the label `com.docker.volume.anonymous` | Made by `create` for each image `VOLUME` and each volume mount without a name. Removed with the last container that mounts them by `docker rm -v`, `--rm`, or `docker container prune`. A volume from a build before the label has no label, so `docker rm -v` keeps it; `docker volume prune` removes it. |
+| Exit records | `~/.gvx/docker/exits/<id>.json` | The exit code of a removed container, for a client that waits for the removal. Deleted after 10 minutes, at the next removal or the next start of `serve`. |
 | Networks | `~/.gvx/docker/networks/<id>.json` | Removed by `docker network rm`. |
 | Registry credentials | `~/.docker/config.json` and credential helpers | Not copied. |
 

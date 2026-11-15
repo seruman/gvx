@@ -179,6 +179,7 @@ func serveCommand(ctx context.Context, args []string, stderr io.Writer) int {
 	builder := &builderProcess{exe: exe, paths: p, log: stderr}
 	defer builder.stop()
 	containers := newContainerStore(p.stateDir)
+	containers.sweepExitRecords(time.Now())
 	server := newServer(cache, builder, containers, processRuntime{exe: exe, paths: p, store: containers}, p.stateDir)
 	server.exe = exe
 	errs := make(chan error, 2)
