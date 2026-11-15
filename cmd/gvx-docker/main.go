@@ -78,6 +78,7 @@ func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  gvx-docker serve [-socket PATH] [-state-dir DIR]")
 	_, _ = fmt.Fprintln(w, "  gvx-docker builder [-state-dir DIR]")
 	_, _ = fmt.Fprintln(w, "  gvx-docker setup [-socket PATH] [-state-dir DIR]")
+	_, _ = fmt.Fprintln(w, "  gvx-docker setup -remove [-state-dir DIR]")
 }
 
 type paths struct {
@@ -205,10 +206,18 @@ func setupCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs := flag.NewFlagSet("gvx-docker setup", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addPathFlags(fs, &p)
+	remove := fs.Bool("remove", false, "Delete the context, the builder, and the buildx aliases that setup wrote")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	p.normalize()
+	if *remove {
+		if err := removeDockerSetup(ctx, p, stdout, stderr); err != nil {
+			_, _ = fmt.Fprintf(stderr, "gvx-docker setup -remove: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if err := setupDocker(ctx, p, stdout, stderr); err != nil {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker setup: %v\n", err)
 		return 1
@@ -240,26 +249,110 @@ func setupDocker(ctx context.Context, p paths, stdout, stderr io.Writer) error {
 	// refuses to create builders with those names, so setup writes their
 	// instance files as copies of the gvx builder. Without them, both start a
 	// BuildKit container in the engine.
-	for _, name := range []string{contextName, "default"} {
-		if err := writeBuilderAlias(name); err != nil {
-			return err
-		}
+	dockerDir, err := dockerConfigDir()
+	if err != nil {
+		return err
 	}
+	return writeBuilderAliases(dockerDir, p.stateDir, stderr)
+}
+
+// removeDockerSetup undoes setupDocker: it deletes the alias files that setup
+// wrote, the gvx builder, and the gvx context. A context or builder that is
+// gone already is not an error.
+func removeDockerSetup(ctx context.Context, p paths, stdout, stderr io.Writer) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	dockerDir, err := dockerConfigDir()
+	if err != nil {
+		return err
+	}
+	if err := removeBuilderAliases(dockerDir, p.stateDir, stderr); err != nil {
+		return err
+	}
+	_ = runDocker(ctx, io.Discard, io.Discard, "buildx", "rm", builderName)
+	_ = runDocker(ctx, io.Discard, io.Discard, "context", "rm", "--force", contextName)
+	_, _ = fmt.Fprintln(stdout, "gvx-docker setup: removed the gvx context, the gvx-buildkit builder, and the aliases that setup wrote")
 	return nil
 }
 
 // writeBuilderAlias copies the instance file of builderName to an instance
 // file with the given name.
-func writeBuilderAlias(alias string) error {
-	dir := os.Getenv("DOCKER_CONFIG")
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
+// setupRecord lists the files that setup wrote, so setup -remove deletes
+// those files and no file of the user.
+type setupRecord struct {
+	// Aliases lists the buildx instance files that setup wrote.
+	Aliases []string `json:"Aliases"`
+}
+
+func setupRecordPath(stateDir string) string { return filepath.Join(stateDir, "setup.json") }
+
+func readSetupRecord(stateDir string) setupRecord {
+	var rec setupRecord
+	_ = readJSONFile(setupRecordPath(stateDir), &rec)
+	return rec
+}
+
+// dockerConfigDir returns the Docker config directory: DOCKER_CONFIG, then
+// ~/.docker.
+func dockerConfigDir() (string, error) {
+	if dir := os.Getenv("DOCKER_CONFIG"); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".docker"), nil
+}
+
+// writeBuilderAliases writes the buildx instances that docker build and
+// docker compose build use, as copies of the gvx builder. It writes an alias
+// only when no instance of that name exists, or when an earlier setup wrote
+// it, and records the files that it owns in the state directory.
+func writeBuilderAliases(dockerDir, stateDir string, stderr io.Writer) error {
+	owned := map[string]bool{}
+	for _, name := range readSetupRecord(stateDir).Aliases {
+		owned[name] = true
+	}
+	instances := filepath.Join(dockerDir, "buildx", "instances")
+	var rec setupRecord
+	for _, name := range []string{contextName, "default"} {
+		path := filepath.Join(instances, name)
+		if _, err := os.Lstat(path); err == nil && !owned[name] {
+			_, _ = fmt.Fprintf(stderr, "gvx-docker setup: keep the buildx instance %q of the user; builds that use it do not go to gvx\n", name)
+			continue
+		}
+		if err := writeBuilderAlias(instances, name); err != nil {
 			return err
 		}
-		dir = filepath.Join(home, ".docker")
+		rec.Aliases = append(rec.Aliases, name)
 	}
-	instances := filepath.Join(dir, "buildx", "instances")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	return writeJSONFile(setupRecordPath(stateDir), rec)
+}
+
+// removeBuilderAliases deletes the buildx instance files that setup recorded,
+// and the record.
+func removeBuilderAliases(dockerDir, stateDir string, stderr io.Writer) error {
+	instances := filepath.Join(dockerDir, "buildx", "instances")
+	var errs []error
+	for _, name := range readSetupRecord(stateDir).Aliases {
+		if name != contextName && name != "default" {
+			continue
+		}
+		if err := os.Remove(filepath.Join(instances, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	if err := os.Remove(setupRecordPath(stateDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func writeBuilderAlias(instances, alias string) error {
 	data, err := os.ReadFile(filepath.Join(instances, builderName))
 	if err != nil {
 		return fmt.Errorf("read the buildx instance %s: %w", builderName, err)
