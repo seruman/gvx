@@ -1371,3 +1371,44 @@ func TestNATDNSRelayServesManyShortLookups(t *testing.T) {
 		}
 	}
 }
+
+// TestNATDNSRelayAnswersAQueryAfterTheFlowLinger sends two queries on one
+// guest UDP socket, 50 ms apart, past udpDNSFlowLinger, as glibc does with
+// "options single-request" under load. The first flow ends between them, so
+// the second datagram opens a new flow. It must get an answer on the first
+// try, well before a resolver would retry.
+func TestNATDNSRelayAnswersAQueryAfterTheFlowLinger(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.42"))
+	s, nf, err := NewNATStack(NATConfig{DNSServers: []string{srv.addr}})
+	if err != nil {
+		t.Fatalf("NewNATStack: %v", err)
+	}
+	defer func() {
+		_ = nf.Close()
+		s.Close()
+	}()
+	dns := tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}), Port: 53}
+	u, err := gonet.DialUDP(s, nil, &dns, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	buf := make([]byte, 512)
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			time.Sleep(5 * udpDNSFlowLinger)
+		}
+		if _, err := u.Write(buildDNSQuery(uint16(100+i), "service.example.test", dnsTypeA)); err != nil {
+			t.Fatal(err)
+		}
+		// A resolver retries after 1 s at the earliest; one try must do.
+		_ = u.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := u.Read(buf)
+		if err != nil {
+			t.Fatalf("query %d on the same socket after the linger: %v", i, err)
+		}
+		if got := answerIPs(t, buf[:n]); len(got) != 1 {
+			t.Fatalf("query %d answer = %v", i, got)
+		}
+	}
+}
