@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -58,10 +59,19 @@ func (s *server) routeVolume(w http.ResponseWriter, r *http.Request, path string
 		s.createVolume(w, r)
 	case path == "/volumes/prune" && r.Method == http.MethodPost:
 		s.pruneVolumes(w)
-	case strings.HasPrefix(path, "/volumes/") && r.Method == http.MethodGet:
-		s.inspectVolume(w, strings.TrimPrefix(path, "/volumes/"))
-	case strings.HasPrefix(path, "/volumes/") && r.Method == http.MethodDelete:
-		s.removeVolume(w, r, strings.TrimPrefix(path, "/volumes/"))
+	case strings.HasPrefix(path, "/volumes/") && (r.Method == http.MethodGet || r.Method == http.MethodDelete):
+		// The name becomes a path below the volume directory, so it must
+		// be a plain volume name, as create requires.
+		name := strings.TrimPrefix(path, "/volumes/")
+		if !volumeNamePattern.MatchString(name) {
+			writeError(w, http.StatusBadRequest, "invalid volume name "+strconv.Quote(name))
+			return true
+		}
+		if r.Method == http.MethodGet {
+			s.inspectVolume(w, name)
+		} else {
+			s.removeVolume(w, r, name)
+		}
 	default:
 		return false
 	}
