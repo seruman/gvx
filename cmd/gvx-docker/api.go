@@ -93,6 +93,8 @@ type server struct {
 	stateDir   string
 	exe        string
 	arch       string
+	// attachDone runs when an attach stream ends. Tests use it.
+	attachDone func()
 	// logEOFHook runs in the log follower after a read reaches the end of
 	// the log and before the follower reads the state. Tests use it.
 	logEOFHook func()

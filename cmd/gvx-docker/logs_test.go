@@ -200,3 +200,49 @@ func TestAttachToAnExitedContainerFollowsTheNextRun(t *testing.T) {
 		t.Fatal("attach did not end after the new run exited")
 	}
 }
+
+// TestAttachEndsWhenTheClientLeaves attaches to a running container and
+// closes the client without detach keys, as a killed CLI does. A read cannot
+// tell a closed client from one that only closed its input, on darwin, so the
+// follower notices the close at its next write, as dockerd does. It must end
+// then, and not poll the log until the container exits.
+func TestAttachEndsWhenTheClientLeaves(t *testing.T) {
+	dir := t.TempDir()
+	s := &server{containers: newContainerStore(dir), networks: newNetworkStore(dir), stateDir: dir}
+	id := strings.Repeat("4", 64)
+	if err := s.containers.create(containerRecord{ID: id, Created: time.Now(), State: containerState{Running: true, Status: "running"}}); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireSupervisorLock(s.containers.dir(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.release()
+	followerDone := make(chan struct{})
+	s.attachDone = func() { close(followerDone) }
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(conn, "POST /containers/%s/attach?stream=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", id)
+	br := bufio.NewReader(conn)
+	if status, _ := br.ReadString('\n'); !strings.Contains(status, "101") {
+		t.Fatalf("attach answered %q", status)
+	}
+	time.Sleep(200 * time.Millisecond)
+	_ = conn.Close()
+	time.Sleep(200 * time.Millisecond)
+	// The container keeps writing. A write to a peer that closed fails
+	// after at most two writes: the first one makes the peer answer RST.
+	for i := 0; i < 5; i++ {
+		appendLog(t, s.containers, id, "after the client left\n")
+		time.Sleep(150 * time.Millisecond)
+	}
+	select {
+	case <-followerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the attach follower kept running after its client closed the connection")
+	}
+}
