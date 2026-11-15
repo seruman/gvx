@@ -70,6 +70,9 @@ type archWorker struct {
 	ids           hvcommon.IDRegisters
 	// unknownExits counts consecutive hvExitReasonUnknown exits.
 	unknownExits int
+	// vtimerOffset is the virtual timer offset that the framework reported
+	// after configure set it.
+	vtimerOffset uint64
 }
 
 // reloadAddr is the address of the stub reload routine in the guest.
@@ -121,6 +124,21 @@ func (w *vcpuWorker) configure() error {
 			return err
 		}
 	}
+	// A zero offset makes CNTVCT_EL0 of the guest equal mach_absolute_time,
+	// the cycle clock of the Sentry (pkg/sentry/time), by the contract of
+	// hv_vcpu.h. The guest vDSO converts the counter with the parameters
+	// that the Sentry calibrates against that clock.
+	if err := hvSetVTimerOffset(w.id, 0); err != nil {
+		return err
+	}
+	off, err := hvGetVTimerOffset(w.id)
+	if err != nil {
+		return err
+	}
+	if off != 0 {
+		return fmt.Errorf("hvf: virtual timer offset of vCPU %d is %d after it was set to 0", w.id, off)
+	}
+	w.vtimerOffset = off
 	if err := w.readIDRegisters(); err != nil {
 		return err
 	}
