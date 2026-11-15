@@ -93,6 +93,9 @@ type server struct {
 	stateDir   string
 	exe        string
 	arch       string
+	// logEOFHook runs in the log follower after a read reaches the end of
+	// the log and before the follower reads the state. Tests use it.
+	logEOFHook func()
 	// stopGrace is the time that stop waits for the supervisor after the
 	// timeout of the container, before it kills the supervisor.
 	stopGrace time.Duration
