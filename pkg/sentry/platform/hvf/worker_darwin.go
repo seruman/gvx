@@ -44,7 +44,7 @@ import (
 // about 15 microseconds, would dominate the round trip. A worker that served
 // a request a moment ago still spins and takes the next request in well under
 // a microsecond. Spinning ends after a bounded budget, so an idle backend
-// burns no CPU.
+// burns no CPU. spinShouldYield decides when a spin gives up its processor.
 
 const (
 	// workerSpin bounds how long an idle worker polls for a request.
@@ -53,20 +53,36 @@ const (
 	callerSpin = 40 * time.Microsecond
 )
 
+// spinYieldAfter is the spin time after which a hand-off yields its processor
+// when GOMAXPROCS leaves the partner goroutine a processor of its own.
+const spinYieldAfter = 10 * time.Microsecond
+
+// spinShouldYield reports whether a spin that has polled for elapsed yields
+// its processor now. A yield moves the spinner to the end of the run queue,
+// so the hand-off then waits for the scheduler. With GOMAXPROCS of 3 or more,
+// the guest worker and the Switch caller each keep a processor, and a yield
+// before spinYieldAfter only adds latency. With 1 or 2 processors, the
+// partner may need the processor of the spinner, so the spin yields at once.
+func spinShouldYield(procs int, elapsed time.Duration) bool {
+	return procs <= 2 || elapsed >= spinYieldAfter
+}
+
 // spinWait polls done until it returns true or the budget ends. It yields the
-// processor periodically so a spinning goroutine cannot starve the goroutine
-// it waits for when GOMAXPROCS is small.
+// processor as spinShouldYield decides, so a spinning goroutine cannot starve
+// the goroutine it waits for when GOMAXPROCS is small.
 func spinWait(budget time.Duration, done func() bool) bool {
+	procs := runtime.GOMAXPROCS(0)
 	start := time.Now()
 	for i := 1; ; i++ {
 		if done() {
 			return true
 		}
 		if i&63 == 0 {
-			if time.Since(start) >= budget {
+			elapsed := time.Since(start)
+			if elapsed >= budget {
 				return false
 			}
-			if i&1023 == 0 {
+			if i&1023 == 0 && spinShouldYield(procs, elapsed) {
 				runtime.Gosched()
 			}
 		}

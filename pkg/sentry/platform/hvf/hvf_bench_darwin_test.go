@@ -16,7 +16,10 @@
 
 package hvf
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // BenchmarkSwitchSyscall measures one guest SVC round trip through Switch.
 // The guest runs SVC and branches back, so every iteration is one exit and
@@ -30,5 +33,26 @@ func BenchmarkSwitchSyscall(b *testing.B) {
 		if err != nil || sig != nil {
 			b.Fatalf("Switch = (%v, %v)", sig, err)
 		}
+	}
+}
+
+// BenchmarkSwitchSyscallParallel runs one guest per goroutine. Each guest
+// loops on a system call, as the threads of a busy multi-threaded program
+// do. b.SetParallelism sets the guests for each GOMAXPROCS.
+func BenchmarkSwitchSyscallParallel(b *testing.B) {
+	plat := newTestPlatform(b)
+	for _, perProc := range []int{1, 2} {
+		b.Run(fmt.Sprintf("guests=%dxGOMAXPROCS", perProc), func(b *testing.B) {
+			b.SetParallelism(perProc)
+			b.RunParallel(func(pb *testing.PB) {
+				g := newGuest(b, plat, insnSVC0, 0x17ffffff) // SVC #0; B .-4
+				for pb.Next() {
+					if sig, _, err := g.switchOnce(); err != nil || sig != nil {
+						b.Errorf("Switch = (%v, %v)", sig, err)
+						return
+					}
+				}
+			})
+		})
 	}
 }
