@@ -1308,9 +1308,20 @@ func (s *server) attachContainer(w http.ResponseWriter, r *http.Request, ref str
 func (s *server) forwardAttachInput(rec containerRecord, input io.Reader) bool {
 	var ctrl net.Conn
 	deadline := time.Now().Add(60 * time.Second)
+	// An attach to an exited container waits for its next run, as docker
+	// start -ai attaches before it starts it. The exit of the run before the
+	// attach must not end the input: the client can send input already.
+	waitAfter := time.Time{}
+	if !rec.State.Running && !rec.State.Restarting && rec.State.Status == "exited" {
+		waitAfter = rec.State.StartedAt
+		if waitAfter.IsZero() {
+			waitAfter = time.Unix(0, 1)
+		}
+	}
 	for {
 		current, err := s.containers.get(rec.ID)
-		if err != nil || current.State.Status == "exited" {
+		staleExit := err == nil && !waitAfter.IsZero() && !current.State.StartedAt.After(waitAfter)
+		if err != nil || (current.State.Status == "exited" && !staleExit) {
 			_, err := io.Copy(io.Discard, input)
 			return errors.Is(err, errDetached)
 		}
