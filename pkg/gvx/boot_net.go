@@ -89,8 +89,12 @@ func (s *Sandbox) initNATStack() error {
 		DNSServers:        s.cfg.HostDNSServers,
 		StreamInterceptor: s.cfg.StreamInterceptor,
 		LocalNames:        s.cfg.LocalNames,
-		Stack:             s.stackOptions(),
-		Tuning:            s.cfg.Tuning,
+		// The fallback answers address queries that no host DNS server
+		// answered. It exists in NAT mode only: the WireGuard relay keeps
+		// every query on its configured servers.
+		FallbackLookupHost: hostFallbackLookup(),
+		Stack:              s.stackOptions(),
+		Tuning:             s.cfg.Tuning,
 	}
 	if !s.cfg.DisableHostLockdown {
 		dialTimeout := s.cfg.Tuning.Duration(tuning.NATDialTimeout)
