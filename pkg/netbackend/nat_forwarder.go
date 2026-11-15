@@ -115,6 +115,14 @@ type NATConfig struct {
 	// servers that were discovered before lockdown.
 	LookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
 
+	// FallbackLookupHost answers A and AAAA queries when every upstream
+	// server timed out, answered SERVFAIL or REFUSED, or no server exists.
+	// The relay gives it a fully qualified name, so the host search domains
+	// do not apply, and filters its answers with IsolateLAN. Other query
+	// types keep the SERVFAIL answer. When nil, the relay has no fallback.
+	// The WireGuard backend has none, so no query leaves outside the tunnel.
+	FallbackLookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
+
 	// LocalNames answers A and AAAA queries before the upstream servers. It
 	// returns false for a name that it does not own. The embedder uses it for
 	// names of other sandboxes, such as Docker service names.
