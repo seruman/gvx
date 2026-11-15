@@ -29,9 +29,47 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"syscall"
 	"time"
 	"unsafe"
+	_ "unsafe" // for go:linkname
 )
+
+// vdsoMonotonic is CLOCK_MONOTONIC read through the vDSO: the Go runtime
+// reads it there without a system call.
+//
+//go:linkname vdsoMonotonic runtime.nanotime
+func vdsoMonotonic() int64
+
+// syscallMonotonic is CLOCK_MONOTONIC read through the system call.
+func syscallMonotonic() int64 {
+	var ts syscall.Timespec
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_CLOCK_GETTIME, 1, uintptr(unsafe.Pointer(&ts)), 0); errno != 0 {
+		return -1
+	}
+	return ts.Nano()
+}
+
+// monotonicSteps reads CLOCK_MONOTONIC for d, alternating the vDSO and the
+// system call. It returns the largest backward step of each source, and the
+// largest backward step from one source to the next reading of the other.
+func monotonicSteps(d time.Duration) (vdsoBack, sysBack, crossBack int64, reads int) {
+	end := vdsoMonotonic() + int64(d)
+	lastV, lastS := vdsoMonotonic(), syscallMonotonic()
+	for {
+		v := vdsoMonotonic()
+		vdsoBack = max(vdsoBack, lastV-v)
+		crossBack = max(crossBack, lastS-v)
+		sv := syscallMonotonic()
+		sysBack = max(sysBack, lastS-sv)
+		crossBack = max(crossBack, v-sv)
+		lastV, lastS = v, sv
+		reads += 2
+		if v >= end {
+			return
+		}
+	}
+}
 
 // atSysinfoEhdr is AT_SYSINFO_EHDR: the auxv key of the vDSO address.
 const atSysinfoEhdr = 33
@@ -61,6 +99,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "read stdin:", err)
 			os.Exit(1)
 		}
+		// Right after a restore, the timekeeper calibrates again. Monotonic
+		// time must not go back meanwhile, in either source.
+		vb, sb, cb, n := monotonicSteps(2 * time.Second)
+		fmt.Printf("mono_vdso_back_ns=%d\nmono_sys_back_ns=%d\nmono_cross_back_ns=%d\nmono_reads=%d\n", vb, sb, cb, n)
 	}
 	// The timekeeper writes the page within a second of the first task. A
 	// restored timekeeper calibrates again, and its time settles within
