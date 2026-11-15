@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,6 +59,13 @@ func runFakeIdleShim() {
 		case "-state-dir":
 			i++
 			stateDir = args[i]
+		case "-life-fd":
+			i++
+			// The real shim ends its guest when the pipe ends; see
+			// watchSupervisor.
+			if fd, err := strconv.Atoi(args[i]); err == nil {
+				go watchSupervisor(os.NewFile(uintptr(fd), "gvx-docker-life"), func() { os.Exit(0) })
+			}
 		case "shim", "-idle":
 		default:
 			id = args[i]
@@ -78,7 +86,7 @@ func runFakeIdleShim() {
 		os.Exit(6)
 	}
 	if f, err := os.OpenFile(filepath.Join(stateDir, "idle-starts"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-		_, _ = f.WriteString("start\n")
+		_, _ = f.WriteString("start " + strconv.Itoa(os.Getpid()) + "\n")
 		_ = f.Close()
 	}
 	term := make(chan os.Signal, 1)
@@ -124,20 +132,28 @@ func fakeIdleShimServer(t *testing.T, id string) *server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	s, err := newFakeIdleShimServer(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func newFakeIdleShimServer(dir, id string) (*server, error) {
 	state := filepath.Join(dir, "state")
 	exe := filepath.Join(dir, "gvx-docker")
 	script := fmt.Sprintf("#!/bin/sh\nexec env GVX_DOCKER_TEST_HELPER=idle-shim %q -test.run='^TestHelperProcess$' -- \"$@\"\n", os.Args[0])
 	if err := os.WriteFile(exe, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	s := &server{containers: newContainerStore(state), networks: newNetworkStore(state), stateDir: state, exe: exe}
 	if err := s.containers.create(containerRecord{ID: id, Created: time.Now(), State: containerState{Status: "exited"}}); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(state, "run"), 0o700); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	return s
+	return s, nil
 }
 
 // TestParallelCopiesShareOneIdleShim runs copies out of one stopped
@@ -445,5 +461,66 @@ func TestRemoveDropsTheStartLockOfTheContainer(t *testing.T) {
 	s.idleShims.mu.Unlock()
 	if kept {
 		t.Fatal("the start lock of a removed container stays in the map")
+	}
+}
+
+// runFakeIdleAPI is an API process that starts the idle sandbox of a copy,
+// says ready, and waits for its end.
+func runFakeIdleAPI() {
+	s, err := newFakeIdleShimServer(os.Getenv("GVX_DOCKER_TEST_DIR"), os.Getenv("GVX_DOCKER_TEST_ID"))
+	if err != nil {
+		os.Exit(3)
+	}
+	if _, _, err := s.archiveControl(context.Background(), os.Getenv("GVX_DOCKER_TEST_ID")); err != nil {
+		os.Exit(4)
+	}
+	_, _ = os.Stdout.WriteString("ready\n")
+	time.Sleep(time.Minute)
+	os.Exit(0)
+}
+
+// TestIdleSandboxEndsWithTheAPIProcess kills the API process while a copy
+// holds an idle sandbox. The idle sandbox must exit too: an orphan holds the
+// root image of the container, so its next start fails, and it runs until
+// someone kills it.
+func TestIdleSandboxEndsWithTheAPIProcess(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gvx-idle-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	id := strings.Repeat("a", 64)
+	api := helperCommand(t, "idle-api", "GVX_DOCKER_TEST_DIR="+dir, "GVX_DOCKER_TEST_ID="+id)
+	out, err := api.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.Start(); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	if n, _ := out.Read(buf); strings.TrimSpace(string(buf[:n])) != "ready" {
+		_ = api.Process.Kill()
+		_ = api.Wait()
+		t.Fatalf("API helper said %q", buf[:n])
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state", "idle-starts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "start")))
+	if err != nil {
+		t.Fatalf("idle-starts = %q", data)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+	_ = api.Process.Kill()
+	_ = api.Wait()
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("idle sandbox %d still runs 5s after its API process died", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

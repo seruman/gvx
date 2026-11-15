@@ -301,15 +301,29 @@ func (m *idleShims) waitIdle(ctx context.Context, id string) error {
 // closes when the process ends.
 func (s *server) startIdleShim(ctx context.Context, rec containerRecord, done chan struct{}) (string, func(), error) {
 	sock := filepath.Join(s.stateDir, "run", rec.ID[:12]+".idle.sock")
-	cmd := exec.Command(s.exe, "shim", "-idle", "-control", sock, "-state-dir", s.stateDir, rec.ID)
+	// The shim reads the end of this pipe as the death of the API process
+	// and exits, as a run shim does with its supervisor, so an idle sandbox
+	// never outlives the API process and keeps the root image locked.
+	lifeRead, lifeWrite, err := os.Pipe()
+	if err != nil {
+		close(done)
+		return "", nil, fmt.Errorf("create copy sandbox pipe: %w", err)
+	}
+	cmd := exec.Command(s.exe, "shim", "-idle", "-life-fd", "3", "-control", sock, "-state-dir", s.stateDir, rec.ID)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
+	cmd.ExtraFiles = []*os.File{lifeRead}
+	setParentDeathSignal(cmd)
+	startErr := cmd.Start()
+	_ = lifeRead.Close()
+	if startErr != nil {
+		_ = lifeWrite.Close()
 		close(done)
-		return "", nil, fmt.Errorf("start copy sandbox: %w", err)
+		return "", nil, fmt.Errorf("start copy sandbox: %w", startErr)
 	}
 	go func() {
 		_ = cmd.Wait()
+		_ = lifeWrite.Close()
 		close(done)
 	}()
 	stop := func() {

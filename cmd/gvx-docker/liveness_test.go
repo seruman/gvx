@@ -70,6 +70,8 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(0)
 	case "idle-shim":
 		runFakeIdleShim()
+	case "idle-api":
+		runFakeIdleAPI()
 	case "exit":
 		os.Exit(0)
 	case "sleep":
