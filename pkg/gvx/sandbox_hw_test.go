@@ -1103,3 +1103,49 @@ func TestSandboxUnixBridgeModeAndLifetime(t *testing.T) {
 		t.Fatal("the bridge kept the host connection open after the run ended")
 	}
 }
+
+// TestSandboxKillOfAPausedGuestEndsTheRun pauses a guest and kills it, as
+// docker kill and docker stop do for a paused container. The run must end,
+// and the pause must not outlive it: Docker thaws a paused container to
+// deliver the signal.
+func TestSandboxKillOfAPausedGuestEndsTheRun(t *testing.T) {
+	churn := acceptprog.BuildChurn(t, runtime.GOARCH)
+	cfg := hostTestConfig(t)
+	cfg.BinaryPath = churn
+	cfg.Argv = []string{"1000000"}
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+	done := make(chan int, 1)
+	go func() {
+		code, _ := sb.Run(context.Background())
+		done <- code
+	}()
+	if err := sb.waitGuestStarted(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Pause(); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := sb.Signal(int(syscall.SIGKILL)); err != nil {
+		t.Fatalf("Signal: %v", err)
+	}
+	select {
+	case code := <-done:
+		if code != 128+int(syscall.SIGKILL) {
+			t.Fatalf("run exit = %d, want %d", code, 128+int(syscall.SIGKILL))
+		}
+	case <-time.After(5 * time.Second):
+		_ = sb.Resume()
+		<-done
+		t.Fatal("SIGKILL of a paused guest did not end the run in 5s")
+	}
+	sb.pauseMu.Lock()
+	paused := sb.userPaused
+	sb.pauseMu.Unlock()
+	if paused {
+		t.Fatal("the pause of the guest outlives its run")
+	}
+}

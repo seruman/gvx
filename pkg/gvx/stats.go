@@ -68,6 +68,16 @@ func (s *Sandbox) Resume() error {
 	return nil
 }
 
+// endPause ends a Pause of the kernel k, if one is in effect.
+func (s *Sandbox) endPause(k *kernel.Kernel) {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	if s.userPaused {
+		k.Unpause()
+		s.userPaused = false
+	}
+}
+
 // Process describes one process of the guest.
 type Process struct {
 	PID     int32

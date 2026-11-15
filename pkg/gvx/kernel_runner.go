@@ -249,6 +249,11 @@ func (s *Sandbox) Signal(signo int) error {
 	if k == nil || tg == nil {
 		return ErrNotRunning
 	}
+	if signo == int(linux.SIGKILL) {
+		// A paused task takes no signal. Docker kills a paused container,
+		// so SIGKILL ends the pause first.
+		s.endPause(k)
+	}
 	return k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(signo)})
 }
 
@@ -616,6 +621,7 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	go func() {
 		select {
 		case <-ctx.Done():
+			s.endPause(k)
 			_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		case <-doneCh:
 		}
@@ -626,6 +632,9 @@ func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg 
 	defer stopGuard()
 
 	tg.WaitExited()
+	// A pause must not outlive its run: exec processes that a pause holds
+	// would block k.WaitExited, and a later run would see a stale flag.
+	s.endPause(k)
 	s.ckptMu.Lock()
 	s.clearActiveKernel()
 	// Release the upper layer before the kernel ends, so the last reference
