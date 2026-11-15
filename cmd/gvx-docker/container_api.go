@@ -657,6 +657,12 @@ func (s *server) startContainer(w http.ResponseWriter, r *http.Request, ref stri
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
+	// A copy into the stopped container holds its root image in an idle
+	// sandbox. The run needs that image, so wait for the copy to end.
+	if err := s.idleShims.waitIdle(r.Context(), rec.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "wait for a copy into the container: "+err.Error())
+		return
+	}
 	if err := s.runtime.start(r.Context(), rec); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
