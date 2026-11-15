@@ -474,6 +474,14 @@ func (s *server) commitContainer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Hold the cache lock from the blob to its image record, so a prune
+	// cannot delete the blob in between: it has no registry source.
+	releaseCache, err := s.cache.LockWrites()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer releaseCache()
 	hexDigest, size, err := s.cache.StoreBlob(bytes.NewReader(layer))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -604,6 +612,14 @@ func (s *server) importImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = gz.Close()
+	// Hold the cache lock from the blob to its image record, so a prune
+	// cannot delete the blob in between: it has no registry source.
+	releaseCache, err := s.cache.LockWrites()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer releaseCache()
 	hexDigest, size, err := s.cache.StoreBlob(bytes.NewReader(compressed.Bytes()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

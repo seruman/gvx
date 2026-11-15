@@ -262,8 +262,18 @@ func (c *LayerCache) CommitLayer(base Image, layerHex string, layerSize int64, c
 }
 
 // StoreImage writes a new image record with the config and the layers, and
-// compiles each layer from the blob store when the cache lacks it.
+// compiles each layer from the blob store when the cache lacks it. A caller
+// that stores a new blob for the image with StoreBlob holds LockWrites from
+// before StoreBlob until StoreImage returns, so no prune deletes the blob in
+// between.
 func (c *LayerCache) StoreImage(config []byte, layers []ocispec.Descriptor, names []Reference) (LoadedImage, error) {
+	// A caller that stored a layer blob for this image holds the lock since
+	// the blob; this shared hold covers the layers that StoreImage compiles.
+	release, err := c.LockWrites()
+	if err != nil {
+		return LoadedImage{}, err
+	}
+	defer release()
 	cfgDigest := digest.FromBytes(config)
 	manifest := ocispec.Manifest{
 		MediaType: ocispec.MediaTypeImageManifest,
@@ -294,6 +304,9 @@ func (c *LayerCache) StoreImage(config []byte, layers []ocispec.Descriptor, name
 		if err != nil {
 			return LoadedImage{}, fmt.Errorf("oci: compile layer %s: %w", l.Digest, err)
 		}
+	}
+	if c.beforeImageRecord != nil {
+		c.beforeImageRecord()
 	}
 	rec := imageRecord{Digest: digest.FromBytes(body).String(), Architecture: arch, Manifests: [][]byte{body}, Config: config}
 	if err := c.registerLoaded(rec, names); err != nil {

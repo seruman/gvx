@@ -71,6 +71,19 @@ type LayerCache struct {
 
 	mu       sync.Mutex
 	verified map[string]verifiedLayer
+	// lockMu guards the shared hold of the cache lock by writers of this
+	// LayerCache. See LockWrites.
+	lockMu sync.Mutex
+	// writeHolds counts the writers that hold the cache lock shared.
+	// +checklocks:lockMu
+	writeHolds int
+	// writeLock is the descriptor of the shared hold while writeHolds > 0.
+	// +checklocks:lockMu
+	writeLock *os.File
+	// beforeImageRecord runs in StoreImage after the layers are in the cache
+	// and before the image record is written. Tests use it to run a prune
+	// at that point.
+	beforeImageRecord func()
 	// keepBlobs keeps the original compressed layer blobs in blobs/sha256.
 	// Guarded by mu.
 	// See EnableBlobStore.
