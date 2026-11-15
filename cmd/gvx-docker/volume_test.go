@@ -171,3 +171,59 @@ func TestParallelRenamesToOneNameConflict(t *testing.T) {
 		t.Fatalf("%d containers have the name shared after two parallel renames (codes %v), want 1", shared, got)
 	}
 }
+
+// TestAnonymousVolumeSharedByTwoContainersStaysWhileUsed mounts the
+// anonymous volume of one container into a second container by name, as
+// Compose does when it recreates a service. rm -v of the first container
+// must keep the volume that the second still mounts, and rm -v of the second
+// must remove it: the volume stays anonymous.
+func TestAnonymousVolumeSharedByTwoContainersStaysWhileUsed(t *testing.T) {
+	state := t.TempDir()
+	s := &server{
+		images:     &fakeImages{images: []oci.Image{{ID: "sha256:img", Config: oci.RuntimeConfig{Volumes: map[string]struct{}{"/data": {}}}}}},
+		builder:    noBuilder{},
+		containers: newContainerStore(state),
+		networks:   newNetworkStore(state),
+		stateDir:   state,
+		arch:       "arm64",
+	}
+	create := func(name, body string) string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/containers/create?name="+name, strings.NewReader(body)))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s = %d %s", name, rec.Code, rec.Body.String())
+		}
+		var out struct{ Id string }
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out.Id
+	}
+	firstID := create("first", `{"Image":"img","HostConfig":{"NetworkMode":"none"}}`)
+	first, err := s.containers.get(firstID)
+	if err != nil || len(first.HostConfig.Binds) != 1 {
+		t.Fatalf("first has binds %v (%v), want the one of its VOLUME", first.HostConfig.Binds, err)
+	}
+	src, _, _ := strings.Cut(first.HostConfig.Binds[0], ":")
+	vol, ok := volumeNameOf(src, s.volumeRoot())
+	if !ok {
+		t.Fatalf("the VOLUME bind %q names no volume", src)
+	}
+	create("second", `{"Image":"img","HostConfig":{"NetworkMode":"none","Binds":["`+vol+`:/data"]}}`)
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/containers/first?v=1", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("rm -v first = %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(s.volumeRoot(), vol)); err != nil {
+		t.Fatalf("rm -v of the first container removed a volume that the second mounts: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/containers/second?v=1", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("rm -v second = %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(s.volumeRoot(), vol)); !os.IsNotExist(err) {
+		t.Fatalf("rm -v of the last user kept the anonymous volume: %v", err)
+	}
+}

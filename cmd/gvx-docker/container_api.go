@@ -197,10 +197,19 @@ func (s *server) createContainer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Mark the volumes that this create made without a name. The mark goes
+	// with the volume, so a later container that mounts it by name keeps it
+	// anonymous.
 	anonymousNames := anonymousMounts
 	for _, b := range anonymous {
 		name, _, _ := strings.Cut(b, ":")
 		anonymousNames = append(anonymousNames, name)
+	}
+	for _, name := range anonymousNames {
+		if err := s.markAnonymousVolume(name); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	req.HostConfig.Binds = binds
 	req.HostConfig.Mounts = withoutVolumeMounts(req.HostConfig.Mounts)
@@ -216,11 +225,10 @@ func (s *server) createContainer(w http.ResponseWriter, r *http.Request) {
 	rec := containerRecord{
 		ID: id, Name: name, Created: time.Now().UTC(), ImageID: img.ID,
 		Config: req.containerConfig, HostConfig: req.HostConfig,
-		State:            containerState{Status: "created", Ports: ports},
-		SeedVolumes:      seeds,
-		AnonymousVolumes: anonymousNames,
-		ConsoleRows:      consoleRows,
-		ConsoleCols:      consoleCols,
+		State:       containerState{Status: "created", Ports: ports},
+		SeedVolumes: seeds,
+		ConsoleRows: consoleRows,
+		ConsoleCols: consoleCols,
 	}
 	applyImageDefaults(&rec.Config, img.Config.Entrypoint, img.Config.Cmd, img.Config.Env, img.Config.WorkingDir, img.Config.User)
 	if rec.Config.StopSignal == "" {
@@ -946,7 +954,7 @@ func (s *server) removeContainer(w http.ResponseWriter, r *http.Request, ref str
 		return
 	}
 	if v := r.URL.Query().Get("v"); v == "1" || v == "true" {
-		if err := removeAnonymousVolumes(rec, s.volumeRoot()); err != nil {
+		if err := s.containers.removeAnonymousVolumes(rec, s.volumeRoot()); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
