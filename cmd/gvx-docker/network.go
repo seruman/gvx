@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -379,14 +380,17 @@ func serveNetworkConn(ctx context.Context, conn *net.UnixConn, stateDir string, 
 }
 
 func answerNetwork(ctx context.Context, stateDir string, store *containerStore, id string, req netRequest) (netResponse, *os.File) {
-	self, err := store.get(id)
-	if err != nil {
-		return netResponse{}, nil
-	}
+	// One scan of the store serves the request. store.get lists every
+	// container too, so a lookup that called both read each record twice.
 	all, err := store.list()
 	if err != nil {
 		return netResponse{}, nil
 	}
+	i := slices.IndexFunc(all, func(c containerRecord) bool { return c.ID == id })
+	if i < 0 {
+		return netResponse{}, nil
+	}
+	self := all[i]
 	switch req.Op {
 	case "resolve":
 		addrs := resolveName(self, all, req.Name)
