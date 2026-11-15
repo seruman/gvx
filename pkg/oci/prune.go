@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 // PruneOptions configures LayerCache.PruneImages.
@@ -144,7 +145,65 @@ func (c *LayerCache) sweepOrphanedCacheFiles() error {
 			}
 		}
 	}
+	if err := c.sweepBlobs(used); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// sweepBlobs removes the blobs that no image record uses, and the temporary
+// blobs older than staleTempBlobAge that a crash left. A younger temporary
+// blob can belong to a pull that runs now.
+func (c *LayerCache) sweepBlobs(used map[string]bool) error {
+	entries, err := os.ReadDir(c.blobDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("oci: list blob directory: %w", err)
+	}
+	var errs []error
+	for _, e := range entries {
+		name := e.Name()
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		remove := false
+		switch {
+		case strings.HasPrefix(name, ".tmp-"):
+			remove = time.Since(info.ModTime()) > staleTempBlobAge
+		case normalizeDigestHex(name) == name:
+			remove = !used[name]
+		}
+		if !remove {
+			continue
+		}
+		if rmErr := os.Remove(filepath.Join(c.blobDir(), name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("oci: remove unused blob: %w", rmErr))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// blobBytes returns the bytes of the blob store, and the bytes of the blobs
+// that no layer in active uses. A nil active counts no blob as reclaimable.
+func (c *LayerCache) blobBytes(active map[string]bool) (total, reclaimable int64) {
+	entries, err := os.ReadDir(c.blobDir())
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		total += info.Size()
+		if active != nil && !active[e.Name()] {
+			reclaimable += info.Size()
+		}
+	}
+	return total, reclaimable
 }
 
 func (c *LayerCache) isOwnedCacheFile(name string) bool {
@@ -174,7 +233,8 @@ func (c *LayerCache) cacheFileBytes() (int64, error) {
 			total += info.Size()
 		}
 	}
-	return total, nil
+	blobs, _ := c.blobBytes(nil)
+	return total + blobs, nil
 }
 
 // DiskUsage computes total and reclaimable image and layer usage across
@@ -256,6 +316,10 @@ func (c *LayerCache) DiskUsage() (CacheDiskUsage, error) {
 			}
 		}
 	}
+
+	blobTotal, blobReclaimable := c.blobBytes(activeLayers)
+	totalBytes += blobTotal
+	reclaimableBytes += blobReclaimable
 
 	return CacheDiskUsage{
 		TotalImages:      len(seenIDs),

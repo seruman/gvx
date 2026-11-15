@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -42,6 +43,10 @@ func (c *LayerCache) EnableBlobStore() {
 	c.keepBlobs = true
 	c.mu.Unlock()
 }
+
+// staleTempBlobAge is the age after which a prune removes a temporary blob.
+// A younger one can belong to a pull that runs now.
+const staleTempBlobAge = time.Hour
 
 func (c *LayerCache) blobDir() string { return filepath.Join(c.dir, "blobs", "sha256") }
 
