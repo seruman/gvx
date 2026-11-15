@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -305,7 +306,7 @@ func TestSuperviseHonorsAStopThatCameBeforeItsLock(t *testing.T) {
 	if err := store.create(containerRecord{ID: id, Created: time.Now(), State: st}); err != nil {
 		t.Fatal(err)
 	}
-	if err := supervise(context.Background(), exe, p, store, id); err != nil {
+	if err := supervise(context.Background(), exe, p, store, id, slog.New(slog.DiscardHandler)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(marker); err == nil {

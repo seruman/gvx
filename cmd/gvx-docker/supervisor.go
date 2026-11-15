@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -168,8 +169,10 @@ func superviseCommand(ctx context.Context, args []string, stderr io.Writer) int 
 		_, _ = fmt.Fprintf(stderr, "gvx-docker supervise: find executable: %v\n", err)
 		return 1
 	}
-	if err := supervise(ctx, exe, p, newContainerStore(p.stateDir), id); err != nil {
-		_, _ = fmt.Fprintf(stderr, "gvx-docker supervise: %v\n", err)
+	// stderr is supervisor.log of the container; see processRuntime.start.
+	log := slog.New(slog.NewTextHandler(stderr, nil)).With("container", shortID(id))
+	if err := supervise(ctx, exe, p, newContainerStore(p.stateDir), id, log); err != nil {
+		log.Error("supervisor failed", "error", err)
 		return 1
 	}
 	return 0
@@ -233,7 +236,7 @@ func parseContainerCommandWith(name string, args []string, stderr io.Writer, ext
 // shim process, because a sandbox locks down its host process and cannot start
 // a second sandbox. The supervisor writes the logs and the state, and it
 // applies the restart policy.
-func supervise(ctx context.Context, exe string, p paths, store *containerStore, id string) error {
+func supervise(ctx context.Context, exe string, p paths, store *containerStore, id string, log *slog.Logger) error {
 	rec, err := store.get(id)
 	if err != nil {
 		return err
@@ -264,6 +267,7 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 		return err
 	}
 	if stopped {
+		log.Info("stop came before the first run", "code", 137)
 		return nil
 	}
 	logFile, err := openRotatingLog(store.logPath(rec.ID), rec.HostConfig.LogConfig)
@@ -284,7 +288,13 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 	restarts := 0
 	backoff := 100 * time.Millisecond
 	for {
+		log.Info("start run", "run", restarts+1)
 		code, runErr := runShimProcess(ctx, exe, p, store, rec.ID, stdout, stderr, sigs)
+		if runErr != nil {
+			log.Warn("run ended", "run", restarts+1, "code", code, "error", runErr)
+		} else {
+			log.Info("run ended", "run", restarts+1, "code", code)
+		}
 		var restart bool
 		current, err := store.update(rec.ID, func(cur *containerRecord) error {
 			cur.State.Running = false
@@ -318,7 +328,9 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 			return nil
 		}
 		restarts++
+		log.Info("restart", "policy", current.HostConfig.RestartPolicy.Name, "backoff", backoff)
 		if !waitRestartBackoff(ctx, store, rec.ID, backoff, sigs) {
+			log.Info("restart cancelled")
 			return nil
 		}
 		backoff = min(backoff*2, 10*time.Second)
