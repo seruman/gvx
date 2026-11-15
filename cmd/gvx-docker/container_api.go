@@ -1070,8 +1070,14 @@ func (s *server) streamLogs(ctx context.Context, w io.Writer, rec containerRecor
 					}
 				}
 			}
+			if s.logEOFHook != nil {
+				s.logEOFHook()
+			}
 			current, getErr := s.containers.get(rec.ID)
 			if getErr != nil || current.State.Status == "exited" {
+				// The container can write its last lines after the read
+				// above and before its exit. Read the rest once more.
+				drainLog(reader, w, opts)
 				return
 			}
 			select {
@@ -1114,6 +1120,22 @@ func (s *server) writeRotatedLogs(w io.Writer, rec containerRecord, opts logOpti
 			}
 		}
 		_ = f.Close()
+	}
+}
+
+// drainLog writes the complete entries that reader still holds.
+func drainLog(reader *bufio.Reader, w io.Writer, opts logOptions) {
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			var e logEntry
+			if json.Unmarshal(line, &e) == nil {
+				writeLogEntry(w, e, opts)
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
