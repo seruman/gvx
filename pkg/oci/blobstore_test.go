@@ -293,3 +293,59 @@ func TestNestedWriteLockDoesNotWaitBehindASweep(t *testing.T) {
 		t.Fatal("the sweep did not run after the writer released the lock")
 	}
 }
+
+// TestUntagDuringACommitKeepsTheSharedLayers untags the last name of a base
+// image while a commit on top of it waits between its layers and its image
+// record. The untag sees no record that uses the base layers and must not
+// delete them: the new record names them.
+func TestUntagDuringACommitKeepsTheSharedLayers(t *testing.T) {
+	reg := newFakeRegistry(t)
+	img := twoLayerImage(t, "arm64", "A=1")
+	reg.addImage(img)
+	reg.tag("latest", img.digest())
+	cache := newCache(t)
+	cache.EnableBlobStore()
+	mustPull(t, reg, cache, "latest", "arm64")
+	ref := reg.srv.Listener.Addr().String() + "/" + testRepo + ":latest"
+	sel, err := cache.Select(ref, "arm64")
+	if err != nil || len(sel.Images) == 0 {
+		t.Fatalf("Select: %v", err)
+	}
+	base := sel.Images[0]
+	content, err := cache.ImageContent(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := ParseReference("committed:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := []byte(`{"architecture":"arm64","os":"linux","config":{"Env":["B=2"]},"rootfs":{"type":"layers","diff_ids":["` + sha256Digest(img.rawLayers[0]) + `","` + sha256Digest(img.rawLayers[1]) + `"]}}`)
+
+	untagDone := make(chan error, 1)
+	cache.beforeImageRecord = func() {
+		go func() {
+			_, err := cache.Untag(base, "latest")
+			untagDone <- err
+		}()
+		select {
+		case err := <-untagDone:
+			untagDone <- err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	if _, err := cache.StoreImage(config, content.Layers, []Reference{name}); err != nil {
+		t.Fatalf("StoreImage: %v", err)
+	}
+	if err := <-untagDone; err != nil {
+		t.Fatalf("Untag: %v", err)
+	}
+	for _, l := range content.Layers {
+		if _, ok := cache.HasLayer(l.Digest.Encoded()); !ok {
+			t.Fatal("the untag deleted a layer that the committed image names")
+		}
+		if _, ok := cache.BlobPath(l.Digest.Encoded()); !ok {
+			t.Fatal("the untag deleted a blob that the committed image names")
+		}
+	}
+}

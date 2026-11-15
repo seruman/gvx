@@ -431,6 +431,13 @@ type RemoveReport struct {
 // digest. When nothing else names the image, Untag deletes the image record
 // and the layer images that no other image uses.
 func (c *LayerCache) Untag(img Image, tag string) (RemoveReport, error) {
+	// The last untag drops the record and deletes the layers that no record
+	// uses, so it is a sweep: it waits for writers, as Remove does.
+	release, err := c.lockSweep()
+	if err != nil {
+		return RemoveReport{}, err
+	}
+	defer release()
 	var report RemoveReport
 	if err := c.removeTagRecord(img, tag, &report); err != nil {
 		return report, err
