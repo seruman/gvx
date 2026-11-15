@@ -262,12 +262,19 @@ func (s *containerStore) exitPath(id string) string {
 	return filepath.Join(filepath.Dir(s.root), "exits", id+".json")
 }
 
+// exitRecordTTL is the age after which an exit record goes. A client that
+// waits for the removal of a container polls every few hundred milliseconds,
+// so it reads the record long before then.
+const exitRecordTTL = 10 * time.Minute
+
 // removeWithExit removes a container and keeps its exit code for a client that
-// waits for the removal.
+// waits for the removal. It also deletes the exit records of earlier removals
+// that are older than exitRecordTTL.
 func (s *containerStore) removeWithExit(id string, code int) error {
 	if err := os.MkdirAll(filepath.Dir(s.exitPath(id)), 0o700); err != nil {
 		return fmt.Errorf("create exit directory: %w", err)
 	}
+	s.sweepExitRecords(time.Now())
 	if err := writeJSONFile(s.exitPath(id), map[string]int{"StatusCode": code}); err != nil {
 		return err
 	}
@@ -347,6 +354,27 @@ func volumeNameOf(src, volumeRoot string) (string, bool) {
 	}
 	name := filepath.Base(filepath.Dir(src))
 	return name, volumeNamePattern.MatchString(name)
+}
+
+// sweepExitRecords deletes the exit records that are older than
+// exitRecordTTL at now. serve calls it at start for the records that an
+// earlier engine left.
+func (s *containerStore) sweepExitRecords(now time.Time) {
+	dir := filepath.Dir(s.exitPath("x"))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || now.Sub(info.ModTime()) < exitRecordTTL {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
 }
 
 func (s *containerStore) removedExitCode(id string) (int, bool) {
