@@ -658,7 +658,11 @@ func (s *server) startContainer(w http.ResponseWriter, r *http.Request, ref stri
 		return
 	}
 	// A copy into the stopped container holds its root image in an idle
-	// sandbox. The run needs that image, so wait for the copy to end.
+	// sandbox. The run needs that image, so wait for the copy to end. The
+	// start lock keeps a copy from booting a new idle sandbox until start
+	// marked the container running.
+	unlockStart := s.idleShims.lockStart(rec.ID)
+	defer unlockStart()
 	if err := s.idleShims.waitIdle(r.Context(), rec.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "wait for a copy into the container: "+err.Error())
 		return

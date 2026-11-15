@@ -77,10 +77,17 @@ func runFakeIdleShim() {
 	if err != nil {
 		os.Exit(6)
 	}
+	if f, err := os.OpenFile(filepath.Join(stateDir, "idle-starts"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		_, _ = f.WriteString("start\n")
+		_ = f.Close()
+	}
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGTERM)
 	go func() {
 		<-term
+		// The real shim closes the root image after SIGTERM, which takes
+		// a moment. It holds the image lock until it exits.
+		time.Sleep(400 * time.Millisecond)
 		os.Exit(0)
 	}()
 	for {
@@ -209,5 +216,109 @@ func TestStartWaitsForACopyOfAStoppedContainer(t *testing.T) {
 	}
 	if released.IsZero() || started.Before(released) {
 		t.Fatal("start ran while a copy held the idle sandbox of the container")
+	}
+}
+
+func idleStarts(t *testing.T, s *server) int {
+	t.Helper()
+	data, _ := os.ReadFile(filepath.Join(s.stateDir, "idle-starts"))
+	return strings.Count(string(data), "start")
+}
+
+// TestCopyAndStartAfterACopyEndsWaitForTheOldSandbox ends a copy and, while
+// its idle sandbox stops, sends a second copy and a start. The old sandbox
+// holds the root image until its process exits. The second copy must not
+// fail on the image lock, and the start must not run before the old process
+// ends.
+func TestCopyAndStartAfterACopyEndsWaitForTheOldSandbox(t *testing.T) {
+	id := strings.Repeat("1", 64)
+	s := fakeIdleShimServer(t, id)
+	rt := &recordingRuntime{}
+	s.runtime = rt
+	_, release, err := s.archiveControl(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasedAt := time.Now()
+	go release()
+	time.Sleep(50 * time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/containers/"+id+"/archive?path=/", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("a copy while the old sandbox stops = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/containers/"+id+"/start", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+	defer cancel()
+	s.startContainer(httptest.NewRecorder(), req.WithContext(ctx), id)
+	rt.mu.Lock()
+	started := rt.started
+	rt.mu.Unlock()
+	// The stop of the second sandbox takes 400 ms after its copy ended.
+	if started.IsZero() || started.Sub(releasedAt) < 400*time.Millisecond {
+		t.Errorf("start ran %v after the first copy ended, before an idle sandbox exited", started.Sub(releasedAt))
+	}
+}
+
+// slowStartRuntime marks the container running after a delay, as start does
+// between its wait for the idle sandbox and its state write.
+type slowStartRuntime struct{ s *server }
+
+func (r slowStartRuntime) start(_ context.Context, rec containerRecord) error {
+	time.Sleep(300 * time.Millisecond)
+	return r.s.containers.updateState(rec.ID, func(st *containerState) {
+		st.Running, st.Status, st.StartPending = true, "running", time.Now().UTC()
+	})
+}
+
+// TestCopyDuringAStartUsesTheRunNotAnIdleSandbox sends a copy while a start
+// of the stopped container runs. The copy must not boot an idle sandbox on
+// the root image that the new run needs.
+func TestCopyDuringAStartUsesTheRunNotAnIdleSandbox(t *testing.T) {
+	id := strings.Repeat("0", 64)
+	s := fakeIdleShimServer(t, id)
+	s.runtime = slowStartRuntime{s: s}
+	startDone := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/containers/"+id+"/start", nil)
+		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+		defer cancel()
+		s.startContainer(httptest.NewRecorder(), req.WithContext(ctx), id)
+		close(startDone)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, release, err := s.archiveControl(ctx, id); err == nil {
+		release()
+	}
+	<-startDone
+	if n := idleStarts(t, s); n != 0 {
+		t.Fatalf("a copy during a start booted %d idle sandboxes on the root image of the run", n)
+	}
+}
+
+// TestCopyIntoARestartingContainerConflicts sends a copy to a container in
+// the wait between two runs of its restart policy. No shim serves its files
+// then, and an idle sandbox would hold the root image that the next run
+// needs, so the copy fails with 409.
+func TestCopyIntoARestartingContainerConflicts(t *testing.T) {
+	id := strings.Repeat("e", 64)
+	s := fakeIdleShimServer(t, id)
+	lock, err := acquireSupervisorLock(s.containers.dir(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.release()
+	_ = s.containers.updateState(id, func(st *containerState) { st.Restarting, st.Status = true, "restarting" })
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/containers/"+id+"/archive?path=/", nil))
+	if rec.Code != http.StatusConflict {
+		t.Errorf("copy into a restarting container = %d, want 409", rec.Code)
+	}
+	if n := idleStarts(t, s); n != 0 {
+		t.Fatalf("a copy into a restarting container booted %d idle sandboxes", n)
 	}
 }

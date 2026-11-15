@@ -110,13 +110,28 @@ func setPathStatHeader(w http.ResponseWriter, st gvx.PathStat) {
 }
 
 // archiveControl returns the control socket of a sandbox that shows the files
-// of the container, and a function that releases it.
+// of the container, and a function that releases it. A running container
+// answers through its own shim. A stopped one boots a shared idle sandbox.
+// A container in the wait between two runs of its restart policy has no shim,
+// and an idle sandbox would take the root image of the next run, so the copy
+// fails with a conflict, as Docker answers during a restart.
 func (s *server) archiveControl(ctx context.Context, ref string) (string, func(), error) {
 	rec, err := s.containers.get(ref)
 	if err != nil {
 		return "", nil, err
 	}
-	if rec.State.Running {
+	// The decision and the acquire run under the start lock of the
+	// container, so a start cannot begin between them.
+	unlock := s.idleShims.lockStart(rec.ID)
+	defer unlock()
+	rec, err = s.containers.get(rec.ID)
+	if err != nil {
+		return "", nil, err
+	}
+	switch {
+	case rec.State.Restarting:
+		return "", nil, fmt.Errorf("%w: container %s is restarting, wait until it is running", errConflict, rec.ID[:12])
+	case rec.State.Running:
 		return controlSocketPath(s.stateDir, rec.ID), func() {}, nil
 	}
 	return s.idleShims.acquire(ctx, s, rec)
@@ -125,11 +140,15 @@ func (s *server) archiveControl(ctx context.Context, ref string) (string, func()
 // idleShims shares one idle sandbox of a stopped container among the copy,
 // export, and commit requests that run at once. The sandbox holds the root
 // upper image of the container with an exclusive lock, so a second sandbox
-// would fail on it, and a start must wait until the last request ends.
+// would fail on it, and a start must wait until the sandbox process ends.
 type idleShims struct {
 	mu sync.Mutex
-	// shims maps a container ID to its idle sandbox.
+	// shims maps a container ID to its idle sandbox. An entry stays until
+	// its process ended, also while it stops.
 	shims map[string]*idleShim
+	// starts maps a container ID to the lock that orders a start against the
+	// "running or idle" decision of a copy.
+	starts map[string]*sync.Mutex
 }
 
 // idleShim is the idle sandbox of one stopped container.
@@ -141,30 +160,70 @@ type idleShim struct {
 	// users counts the requests that hold the sandbox. Guarded by
 	// idleShims.mu.
 	users int
-	stop  func()
+	// stopping reports that the last user released the sandbox. A new
+	// request then waits for done and boots a new sandbox. Guarded by
+	// idleShims.mu.
+	stopping bool
+	stop     func()
 	// done closes when the sandbox process ended.
 	done chan struct{}
 }
 
-// acquire returns the control socket of the idle sandbox of rec, and starts
-// the sandbox when no request holds it. The release function ends the
-// sandbox after the last user.
-func (m *idleShims) acquire(ctx context.Context, s *server, rec containerRecord) (string, func(), error) {
+// lockStart takes the start lock of container id and returns its unlock.
+func (m *idleShims) lockStart(id string) func() {
 	m.mu.Lock()
-	if m.shims == nil {
-		m.shims = map[string]*idleShim{}
+	if m.starts == nil {
+		m.starts = map[string]*sync.Mutex{}
 	}
-	sh, ok := m.shims[rec.ID]
+	l, ok := m.starts[id]
 	if !ok {
-		sh = &idleShim{ready: make(chan struct{}), done: make(chan struct{})}
-		m.shims[rec.ID] = sh
-		go func() {
-			sh.sock, sh.stop, sh.err = s.startIdleShim(context.Background(), rec, sh.done)
-			close(sh.ready)
-		}()
+		l = &sync.Mutex{}
+		m.starts[id] = l
 	}
-	sh.users++
 	m.mu.Unlock()
+	l.Lock()
+	return l.Unlock
+}
+
+// acquire returns the control socket of the idle sandbox of rec, and starts
+// the sandbox when none runs. A sandbox that stops is waited for first, so
+// two sandboxes never hold the root image at once. The release function ends
+// the sandbox after the last user.
+func (m *idleShims) acquire(ctx context.Context, s *server, rec containerRecord) (string, func(), error) {
+	var sh *idleShim
+	for {
+		m.mu.Lock()
+		if m.shims == nil {
+			m.shims = map[string]*idleShim{}
+		}
+		cur, ok := m.shims[rec.ID]
+		if ok && cur.stopping {
+			m.mu.Unlock()
+			select {
+			case <-cur.done:
+				m.mu.Lock()
+				if m.shims[rec.ID] == cur {
+					delete(m.shims, rec.ID)
+				}
+				m.mu.Unlock()
+				continue
+			case <-ctx.Done():
+				return "", nil, ctx.Err()
+			}
+		}
+		if !ok {
+			cur = &idleShim{ready: make(chan struct{}), done: make(chan struct{})}
+			m.shims[rec.ID] = cur
+			go func(sh *idleShim) {
+				sh.sock, sh.stop, sh.err = s.startIdleShim(context.Background(), rec, sh.done)
+				close(sh.ready)
+			}(cur)
+		}
+		cur.users++
+		sh = cur
+		m.mu.Unlock()
+		break
+	}
 
 	release := func() { m.release(rec.ID, sh) }
 	select {
@@ -180,12 +239,14 @@ func (m *idleShims) acquire(ctx context.Context, s *server, rec containerRecord)
 	return sh.sock, release, nil
 }
 
+// release drops one user of sh. The last user stops the sandbox; the entry
+// stays, marked stopping, until the process ended.
 func (m *idleShims) release(id string, sh *idleShim) {
 	m.mu.Lock()
 	sh.users--
 	last := sh.users == 0
 	if last {
-		delete(m.shims, id)
+		sh.stopping = true
 	}
 	m.mu.Unlock()
 	if !last {
@@ -195,11 +256,18 @@ func (m *idleShims) release(id string, sh *idleShim) {
 	if sh.stop != nil {
 		sh.stop()
 	}
+	<-sh.done
+	m.mu.Lock()
+	if m.shims[id] == sh {
+		delete(m.shims, id)
+	}
+	m.mu.Unlock()
 }
 
-// waitIdle returns after the idle sandbox of container id, if one runs,
-// ended, or when ctx ends. The end of the process frees the root image, which
-// is what a start needs, also when a request still holds the entry.
+// waitIdle returns after the idle sandbox of container id, if one runs or
+// stops, ended, or when ctx ends. The end of the process frees the root
+// image, which is what a start needs. The caller holds the start lock, so no
+// new sandbox starts after the wait.
 func (m *idleShims) waitIdle(ctx context.Context, id string) error {
 	m.mu.Lock()
 	sh, ok := m.shims[id]
