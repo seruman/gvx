@@ -31,7 +31,6 @@ import (
 	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/gvx/tuning"
-	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/memutil"
 	"z.gfire.dev/gvx/pkg/sentry/fsimpl/cgroup2fs"
@@ -387,11 +386,11 @@ func (s *Sandbox) initFreshKernel(mf *pgalloc.MemoryFile, hostRAM uint64) (*kern
 	}
 
 	tk := kernel.NewTimekeeper()
-	paramsRange, err := mf.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.System})
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("gvx: allocate VDSO param page: %w", err)
-	}
-	vdsoParams := kernel.NewVDSOParamPage(mf, paramsRange)
+	// The timekeeper writes the clock parameters to the page that the loader
+	// maps below the vDSO of each task. A separate page would leave the vDSO
+	// page empty, and every clock read of the guest would become a system
+	// call.
+	vdsoParams := kernel.NewVDSOParamPage(mf, vdso.ParamPage.FileRange())
 	tk.SetClocks(sentrytime.NewCalibratedClocks(false), vdsoParams)
 
 	creds := auth.NewRootCredentials(auth.NewRootUserNamespace())
