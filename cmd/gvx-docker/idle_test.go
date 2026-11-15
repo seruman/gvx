@@ -322,3 +322,49 @@ func TestCopyIntoARestartingContainerConflicts(t *testing.T) {
 		t.Fatalf("a copy into a restarting container booted %d idle sandboxes", n)
 	}
 }
+
+// countingRuntime counts the runs that start begins, and marks the container
+// running, as the real start does.
+type countingRuntime struct {
+	s      *server
+	mu     sync.Mutex
+	starts int
+}
+
+func (r *countingRuntime) start(_ context.Context, rec containerRecord) error {
+	r.mu.Lock()
+	r.starts++
+	r.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	return r.s.containers.updateState(rec.ID, func(st *containerState) {
+		st.Running, st.Status, st.StartPending = true, "running", time.Now().UTC()
+	})
+}
+
+// TestConcurrentStartsRunTheContainerOnce starts an exited container twice
+// at once. The second start must see the run of the first one and answer
+// 304, not start a second supervisor.
+func TestConcurrentStartsRunTheContainerOnce(t *testing.T) {
+	id := strings.Repeat("d", 64)
+	s := fakeIdleShimServer(t, id)
+	rt := &countingRuntime{s: s}
+	s.runtime = rt
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/containers/"+id+"/start", nil)
+			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			defer cancel()
+			rec := httptest.NewRecorder()
+			s.startContainer(rec, req.WithContext(ctx), id)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+	if rt.starts != 1 {
+		t.Fatalf("two concurrent starts ran the container %d times (codes %v), want once", rt.starts, codes)
+	}
+}

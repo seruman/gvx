@@ -671,6 +671,17 @@ func (s *server) startContainer(w http.ResponseWriter, r *http.Request, ref stri
 	// marked the container running.
 	unlockStart := s.idleShims.lockStart(rec.ID)
 	defer unlockStart()
+	// Another start can have run the container while this one waited for
+	// the lock. Read the state again, as archiveControl does.
+	rec, err = s.containers.get(rec.ID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if rec.State.Running || rec.State.Restarting {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	if err := s.idleShims.waitIdle(r.Context(), rec.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "wait for a copy into the container: "+err.Error())
 		return
