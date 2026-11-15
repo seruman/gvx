@@ -249,10 +249,10 @@ seam pkg/sentry/socket/netlink/netlink_state_autogen.go
 # allocations, and nic.remove unregisters removed links under the nic.go seam.
 seam pkg/tcpip/stack/neighbor_cache.go
 
-# pkg/sentry/time: on macOS, Rdtsc and getCNTFRQ come from tsc_darwin_arm64.s. A guest
-# under Hypervisor.framework reads mach_absolute_time ticks from CNTVCT_EL0, while the host
-# CNTVCT_EL0 counts at another rate and from another base. The Sentry calibrates the guest
-# vDSO against Rdtsc, so Rdtsc must count in the guest domain.
+# pkg/sentry/time: on macOS, Rdtsc and getCNTFRQ come from tsc_darwin_arm64.s, which calls
+# mach_absolute_time and mach_timebase_info. hv_vcpu.h defines the guest CNTVCT_EL0 as
+# mach_absolute_time() - vtimer_offset, and hvf sets the offset to zero. The host CNTVCT_EL0
+# counts at another rate, so the upstream MRS would calibrate the guest vDSO wrongly.
 expr pkg/sentry/time/tsc_arm64.s arm64 && !darwin
 
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
