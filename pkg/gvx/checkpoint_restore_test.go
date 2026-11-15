@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -792,4 +793,34 @@ func TestRestoredGuestReadsTheClockThroughTheVDSO(t *testing.T) {
 		t.Fatalf("restored Run = (%d, %v); stderr=%q", code, err, stderr2.String())
 	}
 	checkClockProbe(t, stdout2.String(), time.Now().UnixNano(), false)
+	checkRestoredMonotonic(t, stdout2.String())
+}
+
+// checkRestoredMonotonic checks the 2 s of CLOCK_MONOTONIC reads that the
+// clockprobe makes right after the restore. Realtime may step while the
+// restored timekeeper calibrates; monotonic may not go back, through the
+// vDSO, through the system call, or from one to the other.
+func checkRestoredMonotonic(t *testing.T, stdout string) {
+	t.Helper()
+	got := map[string]int64{}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || !strings.HasPrefix(k, "mono_") {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatalf("clockprobe line %q: %v", line, err)
+		}
+		got[k] = n
+	}
+	t.Logf("monotonic after restore: %v", got)
+	if got["mono_reads"] < 1000 {
+		t.Fatalf("clockprobe made %d monotonic reads after the restore, want at least 1000", got["mono_reads"])
+	}
+	for _, k := range []string{"mono_vdso_back_ns", "mono_sys_back_ns", "mono_cross_back_ns"} {
+		if got[k] > 0 {
+			t.Errorf("CLOCK_MONOTONIC went back by %d ns after the restore (%s)", got[k], k)
+		}
+	}
 }
