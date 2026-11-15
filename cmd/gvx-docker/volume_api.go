@@ -103,6 +103,22 @@ func (s *server) ensureVolume(name string, labels map[string]string) (volumeReco
 	return rec, writeJSONFile(s.volumeMetaPath(name), rec)
 }
 
+// markAnonymousVolume adds anonymousVolumeLabel to the record of volume name.
+func (s *server) markAnonymousVolume(name string) error {
+	var rec volumeRecord
+	if err := readJSONFile(s.volumeMetaPath(name), &rec); err != nil {
+		return fmt.Errorf("read volume %s: %w", name, err)
+	}
+	if rec.Labels == nil {
+		rec.Labels = map[string]string{}
+	}
+	if _, ok := rec.Labels[anonymousVolumeLabel]; ok {
+		return nil
+	}
+	rec.Labels[anonymousVolumeLabel] = ""
+	return writeJSONFile(s.volumeMetaPath(name), rec)
+}
+
 func (s *server) volumeView(rec volumeRecord) map[string]any {
 	return map[string]any{
 		"Name": rec.Name, "Driver": rec.Driver, "Mountpoint": s.volumeDataDir(rec.Name),

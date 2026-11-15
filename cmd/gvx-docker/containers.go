@@ -187,10 +187,6 @@ type containerRecord struct {
 	// image at their guest path, as "host directory:guest path". The first
 	// start copies the files when the volume is empty.
 	SeedVolumes []string `json:"SeedVolumes,omitempty"`
-	// AnonymousVolumes lists the volumes that create made for this container
-	// alone: one for each VOLUME of the image and each volume mount without
-	// a name. They go with the container on rm -v, --rm, and prune.
-	AnonymousVolumes []string `json:"AnonymousVolumes,omitempty"`
 	// Networks maps a network name to the endpoint of the container on it.
 	Networks map[string]endpointSettings `json:"Networks,omitempty"`
 }
@@ -279,8 +275,8 @@ func (s *containerStore) removeWithExit(id string, code int) error {
 }
 
 // removeContainerAndAnonymousVolumes removes container id, records its exit
-// code for waiters, and removes its anonymous volumes below volumeRoot, as
-// --rm does in Docker.
+// code for waiters, and removes the anonymous volumes that it mounted and no
+// other container mounts, as --rm does in Docker.
 func (s *containerStore) removeContainerAndAnonymousVolumes(id, volumeRoot string, code int) error {
 	rec, err := s.get(id)
 	if err != nil {
@@ -289,16 +285,51 @@ func (s *containerStore) removeContainerAndAnonymousVolumes(id, volumeRoot strin
 	if err := s.removeWithExit(id, code); err != nil {
 		return err
 	}
-	return removeAnonymousVolumes(rec, volumeRoot)
+	return s.removeAnonymousVolumes(rec, volumeRoot)
 }
 
-// removeAnonymousVolumes removes the anonymous volumes of rec below
-// volumeRoot. Docker makes such a volume for each VOLUME of the image and each
-// volume mount without a name, and removes it with its container.
-func removeAnonymousVolumes(rec containerRecord, volumeRoot string) error {
+// anonymousVolumeLabel marks a volume that create made without a name, as
+// Docker does. The mark belongs to the volume: a container that mounts it
+// by name later, as Compose does when it recreates a service, does not make
+// it named.
+const anonymousVolumeLabel = "com.docker.volume.anonymous"
+
+// removeAnonymousVolumes removes each volume below volumeRoot that rec
+// mounts, that has anonymousVolumeLabel, and that no other container mounts.
+// It holds the store lock, so no create or update of a record runs between
+// the check and the removal.
+func (s *containerStore) removeAnonymousVolumes(rec containerRecord, volumeRoot string) error {
+	unlock, err := s.lockAll()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	others, err := s.listLocked()
+	if err != nil {
+		return err
+	}
+	used := map[string]bool{}
+	for _, c := range others {
+		if c.ID == rec.ID {
+			continue
+		}
+		for _, b := range c.HostConfig.Binds {
+			src, _, _ := strings.Cut(b, ":")
+			used[src] = true
+		}
+	}
 	var errs []error
-	for _, name := range rec.AnonymousVolumes {
-		if !volumeNamePattern.MatchString(name) {
+	for _, b := range rec.HostConfig.Binds {
+		src, _, _ := strings.Cut(b, ":")
+		name, ok := volumeNameOf(src, volumeRoot)
+		if !ok || used[src] {
+			continue
+		}
+		var vol volumeRecord
+		if err := readJSONFile(filepath.Join(volumeRoot, name, "volume.json"), &vol); err != nil {
+			continue
+		}
+		if _, anonymous := vol.Labels[anonymousVolumeLabel]; !anonymous {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(volumeRoot, name)); err != nil {
@@ -306,6 +337,16 @@ func removeAnonymousVolumes(rec containerRecord, volumeRoot string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// volumeNameOf returns the volume name of src when src is the data
+// directory volumeRoot/<name>/_data of a volume.
+func volumeNameOf(src, volumeRoot string) (string, bool) {
+	if filepath.Base(src) != "_data" || filepath.Dir(filepath.Dir(src)) != filepath.Clean(volumeRoot) {
+		return "", false
+	}
+	name := filepath.Base(filepath.Dir(src))
+	return name, volumeNamePattern.MatchString(name)
 }
 
 func (s *containerStore) removedExitCode(id string) (int, bool) {
