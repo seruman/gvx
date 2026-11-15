@@ -98,6 +98,9 @@ type server struct {
 	// beforeRename runs in rename between the name check and the update.
 	// Tests use it to make two renames overlap.
 	beforeRename func()
+	// attachRunWait bounds the wait of an attach to an exited container for
+	// its next run. Zero selects 60 seconds.
+	attachRunWait time.Duration
 	// attachDone runs when an attach stream ends. Tests use it.
 	attachDone func()
 	// logEOFHook runs in the log follower after a read reaches the end of
