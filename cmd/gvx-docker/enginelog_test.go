@@ -200,3 +200,35 @@ func TestSuperviseLogsEachRun(t *testing.T) {
 		}
 	}
 }
+
+// TestEngineLogRotatesWhileServeRuns writes past the size limit of an open
+// engine log. The log moves to engine.log.1 at once, not at the next start,
+// so a long-running engine keeps at most two files of the limit.
+func TestEngineLogRotatesWhileServeRuns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, engineLogName)
+	l, err := openRotatingFile(path, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	first := strings.Repeat("a", 40) + "\n"
+	second := strings.Repeat("b", 40) + "\n"
+	third := strings.Repeat("c", 40) + "\n"
+	for _, line := range []string{first, second, third} {
+		if _, err := l.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.ReadFile(path + ".1")
+	if err != nil {
+		t.Fatalf("no engine.log.1 after the log passed its limit: %v", err)
+	}
+	if string(cur) != third || string(old) != second {
+		t.Fatalf("engine.log = %q, engine.log.1 = %q; want the third line and the second line", cur, old)
+	}
+}
