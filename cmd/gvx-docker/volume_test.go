@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/oci"
 )
@@ -115,5 +116,22 @@ func TestAnonymousVolumesGoWithTheirContainer(t *testing.T) {
 	}
 	if got := volumes(); len(got) != 1 || got[0] != "keep" {
 		t.Errorf("volumes after --rm = %v, want only keep", got)
+	}
+}
+
+// TestCreateAcceptsANameThatIsAnIDPrefix creates a container whose name is a
+// prefix of the ID of another container. Hex words such as "add", "cafe", or
+// "c15" are valid names, and only an equal name is a conflict.
+func TestCreateAcceptsANameThatIsAnIDPrefix(t *testing.T) {
+	store := newContainerStore(t.TempDir())
+	other := containerRecord{ID: "cafe" + strings.Repeat("0", 60), Name: "other", Created: time.Now()}
+	if err := store.create(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.create(containerRecord{ID: strings.Repeat("1", 64), Name: "cafe", Created: time.Now()}); err != nil {
+		t.Fatalf("create of the name cafe = %v, want success: it only matches the ID prefix of another container", err)
+	}
+	if err := store.create(containerRecord{ID: strings.Repeat("2", 64), Name: "other", Created: time.Now()}); err == nil {
+		t.Fatal("create of a name in use succeeded")
 	}
 }
