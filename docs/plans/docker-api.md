@@ -74,11 +74,12 @@ A container gets one address on each of its networks. The guest keeps its NAT ad
 
 | Data | Location | Lifetime |
 | :--- | :--- | :--- |
-| Image layers and image records | Existing `pkg/oci` cache | Shared by pulls, loads, and builds. `docker rmi` and `docker image prune` remove records. |
+| Image layers and image records | Existing `pkg/oci` cache | Shared by pulls, loads, and builds. `docker rmi` and `docker image prune` remove records, and the layers and blobs that no record uses. The flock `.cache.lock` orders writers against a prune, also across `gvx-docker` and `rungv`. |
 | BuildKit state and build cache | Volume `gvx-docker-buildkit` | Survives builder and engine restarts. `docker builder prune` clears it. |
 | Container records | `~/.gvx/docker/containers/<id>/config.json` and `state.json` | Removed by `docker rm`. |
 | Container writable layer | `~/.gvx/docker/containers/<id>/rootfs.ext4` | Survives stop and start. Removed by `docker rm`. |
 | Container logs | `~/.gvx/docker/containers/<id>/log.json` | Rotated at a size limit. Removed by `docker rm`. |
+| Setup record | `~/.gvx/docker/setup.json` | Lists the Buildx instance files that `setup` wrote. Removed by `setup -remove`. |
 | Supervisor lock | `~/.gvx/docker/containers/<id>/supervisor.lock` | Held by the live supervisor. Removed by `docker rm`. |
 | Engine lock | `~/.gvx/docker/serve.lock` | Held by the live `serve`. |
 | Shim control socket | `~/.gvx/docker/run/<id12>.sock` | Exists while the container runs. |
@@ -252,7 +253,7 @@ Each change gets its own pull request. A change in Tier 3 files obeys the one-be
 | Risk | Effect | Mitigation |
 | :--- | :--- | :--- |
 | Ports cannot change after lockdown | `docker run -p` cannot add a port to a running sandbox. | Read all ports at create time, as Docker does. |
-| Builder aliases | `gvx-docker setup` writes the Buildx instances `gvx` and `default` as copies of `gvx-buildkit`. Buildx refuses those names in `buildx create`. | Serve `/grpc` with a proxy to BuildKit, so the builder of the engine works. |
+| Builder aliases | `gvx-docker setup` writes the Buildx instances `gvx` and `default` as copies of `gvx-buildkit`, because Buildx refuses those names in `buildx create`. It writes an alias only when no instance of that name exists, and records the files that it writes in `~/.gvx/docker/setup.json`. A `default` builder of the user stays, and `docker compose build` then does not use gvx. `gvx-docker setup -remove` deletes the recorded files, the builder, and the context. | Serve `/grpc` with a proxy to BuildKit, so the builder of the engine works. |
 | A copy into a stopped container | The copy boots a short sandbox, which takes about one second. | Mount the root upper image in the API process. |
 | Windows host | The engine needs descriptor passing and Unix signals. | Port the supervisor protocol to named pipes. |
 | Two processes per container | An idle container costs about 20 MB for its shim and 11 MB for its supervisor, about 31 MB in all, measured with `footprint` on ten `alpine` containers that sleep. `docker run --rm alpine true` takes 0.12 s, and `nginx:alpine` answers HTTP after 0.15 s. | Serve several containers from one supervisor. |
@@ -260,7 +261,7 @@ Each change gets its own pull request. A change in Tier 3 files obeys the one-be
 | `--network container:` | Each container has its own network stack, so the engine refuses the mode with an error. | Run the processes of both containers in one sandbox. |
 | Refused options | The engine refuses `--cap-add`, `--cap-drop`, `--privileged`, `--security-opt`, `--device`, `--gpus`, `--sysctl`, `--pids-limit`, and `--init` with an error, because the Sentry does not apply them. | Map an option to a `gvx.Config` field when a workload needs it. |
 | Signal to a PID 1 without a handler | Linux ignores SIGTERM for a PID 1 without a handler, and Docker then kills it with code 137. The Sentry delivers SIGTERM, so `docker stop` ends such a container at once with code 143. | Apply the PID 1 rule of Linux in the Sentry. |
-| Docker socket bind | The bridge relays bytes only, without peer credentials or descriptors. `/var/run/docker.sock` and `/run/docker.sock` always name this engine. | None needed for the Docker API. |
+| Docker socket bind | The bridge relays bytes only, without peer credentials or descriptors. `/var/run/docker.sock` and `/run/docker.sock` always name this engine. The socket node in the guest has mode `0660`, as on a Docker host, so a guest user other than root needs the group of the socket. | None needed for the Docker API. |
 | Events come from polling | `docker events` sees a change after up to 100 ms. | Send events from the supervisor. |
 
 ## 8. Verification Procedure (Procedural Module)
