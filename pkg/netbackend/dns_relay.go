@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -77,6 +78,12 @@ func (w *WireGuardEndpoint) dnsSemaphore() chan struct{} {
 	return w.dnsSem
 }
 
+// udpDNSFlowLinger is the time that a UDP DNS flow waits for another query
+// after its last answer. glibc sends the A and AAAA queries of one lookup on
+// one socket within microseconds, so they stay on one flow. A query after the
+// linger opens a new flow and is answered.
+const udpDNSFlowLinger = 10 * time.Millisecond
+
 func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 	timeout := nf.cfg.Tuning.Duration(tuning.DNSTimeout)
 	stop := context.AfterFunc(ctx, func() {
@@ -91,13 +98,26 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 
 	sem := nf.dnsSemaphore()
 	var writeMu sync.Mutex
+	var pending atomic.Int32
 	buf := make([]byte, 4096)
+	// A flow is one guest UDP socket. The Go and musl resolvers open a socket
+	// for each query and close it after the answer, so a flow that waits the
+	// whole query time for a next query holds a slot of dnsFlowSem for
+	// nothing. After its first query, a flow ends udpDNSFlowLinger after its
+	// last answer. A later query on the same socket opens a new flow.
+	wait := timeout
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
 		n, err := conn.Read(buf)
 		if err != nil {
+			if isTimeout(err) && pending.Load() > 0 {
+				// An answer is still on its way; a query that arrives
+				// meanwhile must not be lost with the flow.
+				continue
+			}
 			return
 		}
+		wait = min(timeout, udpDNSFlowLinger)
 		req := append([]byte(nil), buf[:n]...)
 		select {
 		case sem <- struct{}{}:
@@ -105,8 +125,10 @@ func (nf *NATForwarder) serveUDPDNS(ctx context.Context, conn net.Conn) {
 			return
 		}
 		connWG.Add(1)
+		pending.Add(1)
 		go func(pkt []byte) {
 			defer func() {
+				pending.Add(-1)
 				<-sem
 				connWG.Done()
 			}()

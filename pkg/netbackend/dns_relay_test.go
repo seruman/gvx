@@ -1333,3 +1333,41 @@ func TestWireGuardDNSRelayHasNoFallback(t *testing.T) {
 		t.Fatal("the WireGuard DNS relay has a fallback")
 	}
 }
+
+// TestNATDNSRelayServesManyShortLookups sends one query from each of many
+// guest UDP sockets in turn, as fast as the relay answers, as the Go and
+// musl resolvers do: they open a socket for each query. A flow must end soon
+// after it answered, so the flows of past lookups do not fill the flow limit
+// and drop new queries.
+func TestNATDNSRelayServesManyShortLookups(t *testing.T) {
+	srv := startFakeDNSServer(t, answerWith("198.51.100.42"))
+	s, nf, err := NewNATStack(NATConfig{DNSServers: []string{srv.addr}})
+	if err != nil {
+		t.Fatalf("NewNATStack: %v", err)
+	}
+	defer func() {
+		_ = nf.Close()
+		s.Close()
+	}()
+	dns := tcpip.FullAddress{NIC: Eth0NICID, Addr: tcpip.AddrFrom4([4]byte{10, 0, 2, 3}), Port: 53}
+	const lookups = 3 * maxNATDNSFlows
+	buf := make([]byte, 512)
+	for i := 0; i < lookups; i++ {
+		u, err := gonet.DialUDP(s, nil, &dns, ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := u.Write(buildDNSQuery(uint16(i), "service.example.test", dnsTypeA)); err != nil {
+			t.Fatal(err)
+		}
+		_ = u.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := u.Read(buf)
+		_ = u.Close()
+		if err != nil {
+			t.Fatalf("lookup %d of %d: %v", i, lookups, err)
+		}
+		if got := answerIPs(t, buf[:n]); len(got) != 1 {
+			t.Fatalf("lookup %d answer = %v", i, got)
+		}
+	}
+}
