@@ -42,7 +42,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netstack"
 	"z.gfire.dev/gvx/pkg/sentry/state/stateio"
-	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
@@ -483,7 +482,7 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 		ValidateFileSizes:                  true,
 		ValidateFileModificationTimestamps: true,
 	}
-	clocks := sentrytime.NewCalibratedClocks(false)
+	clocks := newGuestClocks()
 	loadErr := k.LoadFrom(
 		loadCtx,
 		stateReader,
