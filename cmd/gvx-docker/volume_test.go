@@ -227,3 +227,23 @@ func TestAnonymousVolumeSharedByTwoContainersStaysWhileUsed(t *testing.T) {
 		t.Fatalf("rm -v of the last user kept the anonymous volume: %v", err)
 	}
 }
+
+// TestRenameAcceptsANameThatIsAnIDPrefix renames a container to a hex word
+// that starts the ID of another container. Only an equal name is in use.
+func TestRenameAcceptsANameThatIsAnIDPrefix(t *testing.T) {
+	state := t.TempDir()
+	s := &server{containers: newContainerStore(state), networks: newNetworkStore(state), stateDir: state}
+	for _, rec := range []containerRecord{
+		{ID: "cafe" + strings.Repeat("0", 60), Name: "other", Created: time.Now()},
+		{ID: strings.Repeat("1", 64), Name: "mine", Created: time.Now()},
+	} {
+		if err := s.containers.create(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/containers/mine/rename?name=cafe", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("rename to cafe = %d %s, want 204: cafe only starts the ID of another container", rec.Code, rec.Body.String())
+	}
+}

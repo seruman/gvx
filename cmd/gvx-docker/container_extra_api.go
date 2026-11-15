@@ -216,10 +216,6 @@ func (s *server) renameContainer(w http.ResponseWriter, r *http.Request, ref str
 		writeError(w, http.StatusBadRequest, "invalid container name "+strconv.Quote(name))
 		return
 	}
-	if _, err := s.containers.get(name); err == nil {
-		writeError(w, http.StatusConflict, fmt.Sprintf("Conflict. The container name %q is already in use", "/"+name))
-		return
-	}
 	rec, err := s.containers.get(ref)
 	if err != nil {
 		writeStoreError(w, err)
