@@ -19,6 +19,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -92,5 +94,54 @@ func TestPushSendsNoCredentialsToAnUploadHostOfAnotherOrigin(t *testing.T) {
 	defer mu.Unlock()
 	if len(leaked) != 0 {
 		t.Fatalf("the upload host of another origin got the registry credentials: %q", leaked)
+	}
+}
+
+// TestPushRetriesAFileUploadAfterAChallenge proves that a PUT of a blob from
+// a file survives one authentication challenge. The transport closes an
+// *os.File body after the first attempt, so the retry needs a body that the
+// transport cannot close.
+func TestPushRetriesAFileUploadAfterAChallenge(t *testing.T) {
+	var mu sync.Mutex
+	puts := 0
+	var got []byte
+	var reg *httptest.Server
+	reg = basicRegistry(t, func(*http.Request) string { return "/v2/app/blobs/uploads/1" }, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		puts++
+		body, _ := io.ReadAll(r.Body)
+		if puts == 1 {
+			// An expired token on a slow push: one more challenge.
+			w.Header().Set("Www-Authenticate", `Basic realm="reg"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		got = body
+		w.WriteHeader(http.StatusCreated)
+	})
+	ctx := credentialsFor(t, reg)
+	rc, err := newRegistryClient(nil, reg.URL, "app", DefaultLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.close()
+	data := []byte(strings.Repeat("layer", 1000))
+	path := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := rc.uploadBlob(ctx, digest.FromBytes(data), f, int64(len(data))); err != nil {
+		t.Fatalf("uploadBlob after a challenge on the PUT: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if string(got) != string(data) {
+		t.Fatalf("the registry got %d bytes, want %d", len(got), len(data))
 	}
 }

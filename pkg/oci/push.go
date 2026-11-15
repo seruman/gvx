@@ -139,7 +139,10 @@ func (rc *registryClient) send(ctx context.Context, method, rawURL, contentType 
 			if err != nil {
 				return nil, err
 			}
-			r = b
+			// The transport closes a body that is an io.Closer, such as the
+			// *os.File of a blob. Hide Close, so the retry after a
+			// challenge can rewind the same file.
+			r = io.NopCloser(b)
 		}
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, r)
 		if err != nil {
