@@ -385,3 +385,55 @@ func TestNATVirtualDNSRelayUDPAndTCP(t *testing.T) {
 		t.Fatalf("resolved TCP DNS IP = %s, want 198.51.100.42", gotTCPIP)
 	}
 }
+
+// TestNATLoopbackToHostSurvivesARestore attaches a fresh guest stack to a
+// NAT forwarder with LoopbackToHost, as a restore of a checkpoint does. The
+// default TCP handler of a stack is not saved, so the restore must register
+// the loopback relay again, and a guest dial to 127.0.0.1 must reach the host
+// service.
+func TestNATLoopbackToHostSurvivesARestore(t *testing.T) {
+	hostLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer func() { _ = hostLn.Close() }()
+	hostPort := uint16(hostLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			conn, err := hostLn.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Write([]byte("host"))
+			_ = conn.Close()
+		}
+	}()
+
+	s, natFwd, err := NewNATStack(NATConfig{LoopbackToHost: true})
+	if err != nil {
+		t.Fatalf("NewNATStack failed: %v", err)
+	}
+	defer func() { _ = natFwd.Close() }()
+	s.Close()
+	// A restored guest stack comes from the checkpoint without its default
+	// transport handlers. A new loopback stack stands for it.
+	restored, err := NewLoopbackStack(StackOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if err := natFwd.AttachRestoredStack(restored); err != nil {
+		t.Fatalf("AttachRestoredStack: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, restored, tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}), Port: hostPort}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("guest dial to 127.0.0.1 after a restore: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if got, err := io.ReadAll(conn); err != nil || string(got) != "host" {
+		t.Fatalf("guest dial to 127.0.0.1 after a restore = (%q, %v), want the host service", got, err)
+	}
+}

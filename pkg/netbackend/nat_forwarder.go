@@ -794,6 +794,11 @@ func (nf *NATForwarder) AttachRestoredStackWithConfig(restored *stack.Stack, eth
 	}
 	nf.guestStack = restored
 	nf.mu.Unlock()
+	// The default transport handlers of a stack are not saved, so the
+	// loopback relay goes back in place on the restored stack.
+	if nf.cfg.LoopbackToHost && !nf.cfg.IsolateLAN {
+		registerLoopbackToHost(restored, nf)
+	}
 	restored.Restore()
 	return nil
 }
