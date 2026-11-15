@@ -225,11 +225,13 @@ func (s *server) renameContainer(w http.ResponseWriter, r *http.Request, ref str
 		writeStoreError(w, err)
 		return
 	}
-	if _, err := s.containers.update(rec.ID, func(cur *containerRecord) error {
-		cur.Name = name
-		return nil
-	}); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if s.beforeRename != nil {
+		s.beforeRename()
+	}
+	// Check the name again under the store lock, so two renames or a
+	// rename and a create cannot give one name to two containers.
+	if _, err := s.containers.renameLocked(rec.ID, name); err != nil {
+		writeStoreError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
