@@ -368,3 +368,57 @@ func TestConcurrentStartsRunTheContainerOnce(t *testing.T) {
 		t.Fatalf("two concurrent starts ran the container %d times (codes %v), want once", rt.starts, codes)
 	}
 }
+
+// TestNewIdleSandboxKeepsItsSocketWhenTheOldOneStops ends a copy and starts
+// a second one while the old idle sandbox stops. The old stop removes its
+// socket after its process ended. A new sandbox on the same socket path must
+// boot only after that removal, or it loses its socket and the copy fails.
+func TestNewIdleSandboxKeepsItsSocketWhenTheOldOneStops(t *testing.T) {
+	id := strings.Repeat("c", 64)
+	s := fakeIdleShimServer(t, id)
+	_, release, err := s.archiveControl(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// After the old process ended and before the old stop removes the
+	// socket, a second copy acquires a sandbox. The hook waits until that
+	// acquire returns or 2 seconds pass, then the old stop goes on.
+	type acquired struct {
+		sock    string
+		release func()
+		err     error
+	}
+	second := make(chan acquired, 1)
+	var once sync.Once
+	s.beforeIdleSocketRemove = func() {
+		once.Do(func() {
+			got := make(chan acquired, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				sock, rel, err := s.archiveControl(ctx, id)
+				got <- acquired{sock, rel, err}
+			}()
+			select {
+			case a := <-got:
+				second <- a
+			case <-time.After(2 * time.Second):
+				go func() { second <- <-got }()
+			}
+		})
+	}
+	release()
+	var a acquired
+	select {
+	case a = <-second:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second copy did not get a sandbox")
+	}
+	if a.err != nil {
+		t.Fatalf("second acquire: %v", a.err)
+	}
+	defer a.release()
+	if _, err := requestStat(context.Background(), a.sock, "/"); err != nil {
+		t.Fatalf("the new idle sandbox lost its socket to the stop of the old one: %v", err)
+	}
+}
