@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,23 +40,81 @@ const engineLogName = "engine.log"
 const engineLogMaxSize = 10 << 20
 
 // openEngineLog opens the engine log of stateDir and returns a writer that
-// writes to the file and to stderr. A log larger than engineLogMaxSize moves
-// to engine.log.1 first. The returned function closes the file.
+// writes to the file and to stderr. The log moves to engine.log.1 when it
+// passes engineLogMaxSize, also while serve runs. The returned function
+// closes the file.
 func openEngineLog(stateDir string, stderr io.Writer) (io.Writer, func(), error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("create state directory: %w", err)
 	}
-	path := filepath.Join(stateDir, engineLogName)
-	if info, err := os.Stat(path); err == nil && info.Size() > engineLogMaxSize {
-		if err := os.Rename(path, path+".1"); err != nil {
-			return nil, nil, fmt.Errorf("rotate engine log: %w", err)
-		}
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := openRotatingFile(filepath.Join(stateDir, engineLogName), engineLogMaxSize)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open engine log: %w", err)
 	}
 	return io.MultiWriter(f, stderr), func() { _ = f.Close() }, nil
+}
+
+// rotatingFile is an append-only file that moves to path.1 before a write
+// would take it past maxSize. It keeps one old file.
+type rotatingFile struct {
+	mu      sync.Mutex
+	path    string
+	maxSize int64
+	file    *os.File
+	size    int64
+}
+
+// openRotatingFile opens path for appending. A file that is already larger
+// than maxSize moves to path.1 first.
+func openRotatingFile(path string, maxSize int64) (*rotatingFile, error) {
+	r := &rotatingFile{path: path, maxSize: maxSize}
+	if info, err := os.Stat(path); err == nil && info.Size() > maxSize {
+		if err := os.Rename(path, path+".1"); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.openLocked(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *rotatingFile) openLocked() error {
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	r.file, r.size = f, info.Size()
+	return nil
+}
+
+func (r *rotatingFile) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size > 0 && r.size+int64(len(p)) > r.maxSize {
+		// A failed rotation keeps the current file: losing log lines is
+		// worse than a log above its limit.
+		if err := r.file.Close(); err == nil {
+			_ = os.Rename(r.path, r.path+".1")
+			if err := r.openLocked(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	n, err := r.file.Write(p)
+	r.size += int64(n)
+	return n, err
+}
+
+func (r *rotatingFile) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.file.Close()
 }
 
 // logRequests logs one line for each API request after the handler ends:
