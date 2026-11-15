@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -151,6 +152,17 @@ func serveCommand(ctx context.Context, args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer stateLock.release()
+	// The engine log holds the request log, the errors of serve, and the
+	// output of the builder. It also goes to stderr.
+	engineOut, closeEngineLog, err := openEngineLog(p.stateDir, stderr)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: %v\n", err)
+		return 1
+	}
+	defer closeEngineLog()
+	stderr = engineOut
+	log := slog.New(slog.NewTextHandler(engineOut, nil))
+	log.Info("serve", "socket", p.apiSocket, "state_dir", p.stateDir, "pid", os.Getpid())
 	exe, err := os.Executable()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: find executable: %v\n", err)
@@ -174,7 +186,7 @@ func serveCommand(ctx context.Context, args []string, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: %v\n", err)
 		return 1
 	}
-	go func() { errs <- serveUnix(ctx, p.apiSocket, server) }()
+	go func() { errs <- serveUnix(ctx, p.apiSocket, logRequests(server, log)) }()
 	go func() { errs <- serveBuildKitProxy(ctx, p.buildkitSock, p.backendSock, builder) }()
 	if err := <-errs; err != nil && !errors.Is(err, context.Canceled) {
 		_, _ = fmt.Fprintf(stderr, "gvx-docker serve: %v\n", err)

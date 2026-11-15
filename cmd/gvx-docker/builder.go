@@ -81,7 +81,7 @@ func (b *builderProcess) ensure(ctx context.Context) error {
 	}()
 	err := waitForSocket(waitCtx, b.paths.backendSock, 60*time.Second)
 	if err != nil && isClosed(exited) && ctx.Err() == nil {
-		return errors.New("the BuildKit builder exited before it opened its socket; see the serve log")
+		return errors.New("the BuildKit builder exited before it opened its socket; see engine.log in the state directory")
 	}
 	return err
 }
