@@ -152,14 +152,17 @@ func (rc *registryClient) send(ctx context.Context, method, rawURL, contentType 
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
-		if rc.authz != "" {
+		// The credentials of the registry go only to the registry. An
+		// upload Location can name another host, which must not get them.
+		sameOrigin := req.URL.Scheme == rc.baseURL.Scheme && canonicalHost(req.URL) == canonicalHost(rc.baseURL)
+		if rc.authz != "" && sameOrigin {
 			req.Header.Set("Authorization", rc.authz)
 		}
 		resp, err := rc.http.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("oci: request %s: %w", rawURL, err)
 		}
-		if resp.StatusCode != http.StatusUnauthorized || attempt > 0 {
+		if resp.StatusCode != http.StatusUnauthorized || attempt > 0 || !sameOrigin {
 			return resp, nil
 		}
 		headers := resp.Header.Values("WWW-Authenticate")
