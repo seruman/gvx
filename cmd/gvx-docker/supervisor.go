@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -312,7 +313,7 @@ func supervise(ctx context.Context, exe string, p paths, store *containerStore, 
 		}
 		if !restart {
 			if current.HostConfig.AutoRemove {
-				return store.removeWithExit(current.ID, code)
+				return store.removeContainerAndAnonymousVolumes(current.ID, filepath.Join(p.stateDir, "volumes"), code)
 			}
 			return nil
 		}

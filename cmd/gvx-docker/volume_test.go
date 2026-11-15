@@ -17,11 +17,15 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"z.gfire.dev/gvx/pkg/oci"
 )
 
 // TestVolumeHandlersRefuseNamesOutsideTheVolumeDirectory sends a volume name
@@ -47,5 +51,69 @@ func TestVolumeHandlersRefuseNamesOutsideTheVolumeDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(victim, "volume.json")); err != nil {
 		t.Fatalf("a volume request removed a directory outside the volume directory: %v", err)
+	}
+}
+
+// TestAnonymousVolumesGoWithTheirContainer creates containers whose image
+// declares a VOLUME and whose request mounts a volume without a name. Each
+// gets anonymous volumes. docker rm -v, container prune, and --rm must remove
+// them, as Docker does; a named volume stays.
+func TestAnonymousVolumesGoWithTheirContainer(t *testing.T) {
+	state := t.TempDir()
+	s := &server{
+		images:     &fakeImages{images: []oci.Image{{ID: "sha256:img", Config: oci.RuntimeConfig{Volumes: map[string]struct{}{"/data": {}}}}}},
+		builder:    noBuilder{},
+		containers: newContainerStore(state),
+		networks:   newNetworkStore(state),
+		stateDir:   state,
+		arch:       "arm64",
+	}
+	create := func(name string) string {
+		t.Helper()
+		body := `{"Image":"img","HostConfig":{"NetworkMode":"none","Binds":["keep:/keep"],"Mounts":[{"Type":"volume","Target":"/cache"}]}}`
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/containers/create?name="+name, strings.NewReader(body)))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s = %d %s", name, rec.Code, rec.Body.String())
+		}
+		var out struct{ Id string }
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out.Id
+	}
+	volumes := func() []string {
+		entries, _ := os.ReadDir(s.volumeRoot())
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+
+	create("withv")
+	if got := len(volumes()); got != 3 {
+		t.Fatalf("volumes after create = %v, want keep and two anonymous ones", volumes())
+	}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/containers/withv?v=1", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("rm -v = %d %s", rec.Code, rec.Body.String())
+	}
+	if got := volumes(); len(got) != 1 || got[0] != "keep" {
+		t.Errorf("volumes after rm -v = %v, want only keep", got)
+	}
+
+	create("pruned")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/containers/prune", nil))
+	if got := volumes(); len(got) != 1 || got[0] != "keep" {
+		t.Errorf("volumes after container prune = %v, want only keep", got)
+	}
+
+	id := create("autorm")
+	if err := s.containers.removeContainerAndAnonymousVolumes(id, s.volumeRoot(), 0); err != nil {
+		t.Fatalf("auto remove: %v", err)
+	}
+	if got := volumes(); len(got) != 1 || got[0] != "keep" {
+		t.Errorf("volumes after --rm = %v, want only keep", got)
 	}
 }

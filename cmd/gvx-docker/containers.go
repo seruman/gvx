@@ -187,6 +187,10 @@ type containerRecord struct {
 	// image at their guest path, as "host directory:guest path". The first
 	// start copies the files when the volume is empty.
 	SeedVolumes []string `json:"SeedVolumes,omitempty"`
+	// AnonymousVolumes lists the volumes that create made for this container
+	// alone: one for each VOLUME of the image and each volume mount without
+	// a name. They go with the container on rm -v, --rm, and prune.
+	AnonymousVolumes []string `json:"AnonymousVolumes,omitempty"`
 	// Networks maps a network name to the endpoint of the container on it.
 	Networks map[string]endpointSettings `json:"Networks,omitempty"`
 }
@@ -268,6 +272,36 @@ func (s *containerStore) removeWithExit(id string, code int) error {
 		return err
 	}
 	return s.remove(id)
+}
+
+// removeContainerAndAnonymousVolumes removes container id, records its exit
+// code for waiters, and removes its anonymous volumes below volumeRoot, as
+// --rm does in Docker.
+func (s *containerStore) removeContainerAndAnonymousVolumes(id, volumeRoot string, code int) error {
+	rec, err := s.get(id)
+	if err != nil {
+		return err
+	}
+	if err := s.removeWithExit(id, code); err != nil {
+		return err
+	}
+	return removeAnonymousVolumes(rec, volumeRoot)
+}
+
+// removeAnonymousVolumes removes the anonymous volumes of rec below
+// volumeRoot. Docker makes such a volume for each VOLUME of the image and each
+// volume mount without a name, and removes it with its container.
+func removeAnonymousVolumes(rec containerRecord, volumeRoot string) error {
+	var errs []error
+	for _, name := range rec.AnonymousVolumes {
+		if !volumeNamePattern.MatchString(name) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(volumeRoot, name)); err != nil {
+			errs = append(errs, fmt.Errorf("remove anonymous volume %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *containerStore) removedExitCode(id string) (int, bool) {
