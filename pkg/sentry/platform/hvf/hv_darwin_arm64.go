@@ -87,6 +87,8 @@ type hvArchSymbols struct {
 	vcpuGetSysReg    uintptr
 	vcpuSetSysReg    uintptr
 	vcpuGetSimdFPReg uintptr
+	vcpuGetVTimerOff uintptr
+	vcpuSetVTimerOff uintptr
 }
 
 func (s *hvSymbols) resolveArch(resolve func(string) (uintptr, error)) error {
@@ -104,6 +106,8 @@ func (s *hvSymbols) resolveArch(resolve func(string) (uintptr, error)) error {
 		{"hv_vcpu_get_sys_reg", &s.vcpuGetSysReg},
 		{"hv_vcpu_set_sys_reg", &s.vcpuSetSysReg},
 		{"hv_vcpu_get_simd_fp_reg", &s.vcpuGetSimdFPReg},
+		{"hv_vcpu_get_vtimer_offset", &s.vcpuGetVTimerOff},
+		{"hv_vcpu_set_vtimer_offset", &s.vcpuSetVTimerOff},
 	} {
 		sym, err := resolve(entry.name)
 		if err != nil {
@@ -225,6 +229,33 @@ func hvGetSimdFPReg(id uint64, q uint32) ([2]uint64, error) {
 		return [2]uint64{}, err
 	}
 	return val, nil
+}
+
+// hvSetVTimerOffset sets the virtual timer offset of a vCPU. hv_vcpu.h
+// defines CNTVCT_EL0 = mach_absolute_time() - vtimer_offset. Only the creating
+// thread may call it.
+func hvSetVTimerOffset(id, offset uint64) error {
+	s, err := loadSymbols()
+	if err != nil {
+		return err
+	}
+	r1, _, _ := darwinSyscall6(s.vcpuSetVTimerOff, uintptr(id), uintptr(offset), 0, 0, 0, 0)
+	return hvResult("hv_vcpu_set_vtimer_offset", r1)
+}
+
+// hvGetVTimerOffset reads the virtual timer offset of a vCPU. Only the
+// creating thread may call it.
+func hvGetVTimerOffset(id uint64) (uint64, error) {
+	s, err := loadSymbols()
+	if err != nil {
+		return 0, err
+	}
+	var off uint64
+	r1, _, _ := darwinSyscall6(s.vcpuGetVTimerOff, uintptr(id), uintptr(unsafe.Pointer(&off)), 0, 0, 0, 0)
+	if err := hvResult("hv_vcpu_get_vtimer_offset", r1); err != nil {
+		return 0, err
+	}
+	return off, nil
 }
 
 // readSystemCounter returns CNTPCT_EL0, the hardware system counter. The host
