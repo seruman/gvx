@@ -93,6 +93,8 @@ type server struct {
 	stateDir   string
 	exe        string
 	arch       string
+	// idleShims holds the idle sandboxes of stopped containers for copies.
+	idleShims idleShims
 	// attachDone runs when an attach stream ends. Tests use it.
 	attachDone func()
 	// logEOFHook runs in the log follower after a read reaches the end of

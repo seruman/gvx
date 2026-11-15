@@ -68,6 +68,8 @@ func TestHelperProcess(t *testing.T) {
 		prepareShimProcess()
 		_, _ = os.Stderr.WriteString("gvx-docker: context canceled\n")
 		os.Exit(0)
+	case "idle-shim":
+		runFakeIdleShim()
 	case "exit":
 		os.Exit(0)
 	case "sleep":

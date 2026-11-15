@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -118,24 +119,118 @@ func (s *server) archiveControl(ctx context.Context, ref string) (string, func()
 	if rec.State.Running {
 		return controlSocketPath(s.stateDir, rec.ID), func() {}, nil
 	}
-	return s.startIdleShim(ctx, rec)
+	return s.idleShims.acquire(ctx, s, rec)
 }
 
-// startIdleShim runs the container with the idle program until release.
-func (s *server) startIdleShim(ctx context.Context, rec containerRecord) (string, func(), error) {
+// idleShims shares one idle sandbox of a stopped container among the copy,
+// export, and commit requests that run at once. The sandbox holds the root
+// upper image of the container with an exclusive lock, so a second sandbox
+// would fail on it, and a start must wait until the last request ends.
+type idleShims struct {
+	mu sync.Mutex
+	// shims maps a container ID to its idle sandbox.
+	shims map[string]*idleShim
+}
+
+// idleShim is the idle sandbox of one stopped container.
+type idleShim struct {
+	// ready closes when the sandbox serves its control socket or failed.
+	ready chan struct{}
+	sock  string
+	err   error
+	// users counts the requests that hold the sandbox. Guarded by
+	// idleShims.mu.
+	users int
+	stop  func()
+	// done closes when the sandbox process ended.
+	done chan struct{}
+}
+
+// acquire returns the control socket of the idle sandbox of rec, and starts
+// the sandbox when no request holds it. The release function ends the
+// sandbox after the last user.
+func (m *idleShims) acquire(ctx context.Context, s *server, rec containerRecord) (string, func(), error) {
+	m.mu.Lock()
+	if m.shims == nil {
+		m.shims = map[string]*idleShim{}
+	}
+	sh, ok := m.shims[rec.ID]
+	if !ok {
+		sh = &idleShim{ready: make(chan struct{}), done: make(chan struct{})}
+		m.shims[rec.ID] = sh
+		go func() {
+			sh.sock, sh.stop, sh.err = s.startIdleShim(context.Background(), rec, sh.done)
+			close(sh.ready)
+		}()
+	}
+	sh.users++
+	m.mu.Unlock()
+
+	release := func() { m.release(rec.ID, sh) }
+	select {
+	case <-sh.ready:
+	case <-ctx.Done():
+		release()
+		return "", nil, ctx.Err()
+	}
+	if sh.err != nil {
+		release()
+		return "", nil, sh.err
+	}
+	return sh.sock, release, nil
+}
+
+func (m *idleShims) release(id string, sh *idleShim) {
+	m.mu.Lock()
+	sh.users--
+	last := sh.users == 0
+	if last {
+		delete(m.shims, id)
+	}
+	m.mu.Unlock()
+	if !last {
+		return
+	}
+	<-sh.ready
+	if sh.stop != nil {
+		sh.stop()
+	}
+}
+
+// waitIdle returns after the idle sandbox of container id, if one runs,
+// ended, or when ctx ends. The end of the process frees the root image, which
+// is what a start needs, also when a request still holds the entry.
+func (m *idleShims) waitIdle(ctx context.Context, id string) error {
+	m.mu.Lock()
+	sh, ok := m.shims[id]
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	select {
+	case <-sh.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startIdleShim runs the container with the idle program until stop. done
+// closes when the process ends.
+func (s *server) startIdleShim(ctx context.Context, rec containerRecord, done chan struct{}) (string, func(), error) {
 	sock := filepath.Join(s.stateDir, "run", rec.ID[:12]+".idle.sock")
 	cmd := exec.Command(s.exe, "shim", "-idle", "-control", sock, "-state-dir", s.stateDir, rec.ID)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
+		close(done)
 		return "", nil, fmt.Errorf("start copy sandbox: %w", err)
 	}
-	done := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
 		close(done)
 	}()
-	release := func() {
+	stop := func() {
 		// SIGTERM ends the idle program, and the shim closes the root upper
 		// image cleanly, so the copy reaches the disk.
 		_ = cmd.Process.Signal(syscall.SIGTERM)
@@ -156,10 +251,10 @@ func (s *server) startIdleShim(ctx context.Context, rec containerRecord) (string
 		default:
 		}
 		if _, err := requestStat(ctx, sock, "/"); err == nil {
-			return sock, release, nil
+			return sock, stop, nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			release()
+			stop()
 			return "", nil, errors.New("copy sandbox did not start")
 		}
 		time.Sleep(20 * time.Millisecond)
