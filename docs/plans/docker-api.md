@@ -242,7 +242,7 @@ Each change is in a Tier 1 file. The upstream audit stays at 4.16%.
 | `ErrExecutableNotFound` | `docker exec` of a missing command exits with 127, which Testcontainers reads. | M6 |
 | `Exec` waits for the guest | `docker exec` right after `docker run -d` finds the guest. | M6 |
 | `oci.WithCredentials`, `VerifyLogin` | The engine uses the `X-Registry-Auth` credentials of each request and checks `docker login` without a store. | M6 |
-| `Config.LoopbackToHost`, `NATConfig.LoopbackToHost` | A build reaches a registry on `localhost` of the Mac. Containers keep their own loopback. | M6 |
+| `Config.LoopbackToHost`, `NATConfig.LoopbackToHost` | With `gvx-docker serve -builder-host-loopback`, a build reaches a registry on `localhost` of the Mac. The flag is off by default, because `RUN` steps share the network of the builder, so any Dockerfile then reaches every service on the loopback of the Mac. Without the flag, a build reaches the Mac at `host.docker.internal`; a plain HTTP registry there needs `registry.insecure=true` or an `http = true` entry in `~/.gvx/docker/buildkitd.toml`. Containers keep their own loopback in every case. | M6 |
 
 The supervisor writes the logs, so the logs need no pre-opened writer in the sandbox.
 
