@@ -58,6 +58,9 @@ func TestHostFallbackLookupChild(t *testing.T) {
 // the fallback in a process under the Seatbelt profile of a NAT sandbox. The
 // child process never resolved the name before.
 func TestHostFallbackLookupWorksAfterLockdown(t *testing.T) {
+	if os.Getenv("GVX_E2E_OFFLINE") == "1" {
+		t.Skip("network tests are off (GVX_E2E_OFFLINE=1)")
+	}
 	const host = "example.com."
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
