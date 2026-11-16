@@ -221,7 +221,7 @@ Each change is in a Tier 1 file. The upstream audit stays at 4.16%.
 
 | Change | Reason | Milestone |
 | :--- | :--- | :--- |
-| `Config.RootfsUpperPath` | An `ext4lite` image holds the root writes, so `docker stop` and `docker start` keep them. | M2 |
+| `Config.RootVolume` | An `ext4lite` image holds the root writes, so `docker stop` and `docker start` keep them. | M2 |
 | `Sandbox.Signal` | `docker stop` and `docker kill` send a signal to the main process. | M2 |
 | `Sandbox.Exec`, `ExecProcess` | `docker exec` starts a process in a running guest. | M3 |
 | `Sandbox.Resize`, `ExecProcess.Resize` | A terminal client changes the window size. | M3 |
