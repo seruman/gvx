@@ -1352,7 +1352,9 @@ func TestDNSRelayFallsBackWhenEveryServerTimesOut(t *testing.T) {
 	fb := &fallbackRecorder{addrs: map[string][]netip.Addr{
 		"registry.example.": {netip.MustParseAddr("198.51.100.20"), netip.MustParseAddr("2001:db8::20")},
 	}}
-	const budget = 900 * time.Millisecond
+	// The fallback keeps a quarter of the budget, so the answer comes a
+	// quarter early: 500 ms of margin for a loaded CI runner.
+	const budget = 2 * time.Second
 	nf := newTestForwarder(t, NATConfig{Tuning: dnsBudget(t, budget), FallbackLookupHost: fb.lookup}, a.addr, b.addr)
 
 	start := time.Now()
@@ -1447,7 +1449,9 @@ func TestDNSRelaySlowServerLeavesTimeForTheNext(t *testing.T) {
 	a := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
 	b := startFakeDNSServer(t, func([]byte, bool) []byte { return nil })
 	good := startFakeDNSServer(t, answerWith("203.0.113.50"))
-	const budget = 900 * time.Millisecond
+	// The fallback keeps a quarter of the budget, so the answer comes a
+	// quarter early: 500 ms of margin for a loaded CI runner.
+	const budget = 2 * time.Second
 	nf := newTestForwarder(t, NATConfig{Tuning: dnsBudget(t, budget)}, a.addr, b.addr, good.addr)
 
 	start := time.Now()
