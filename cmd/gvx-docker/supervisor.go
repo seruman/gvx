@@ -760,7 +760,6 @@ func sandboxConfig(rec containerRecord, rootfsPath, engineSocket string) (gvx.Co
 		AllowSUID:              true,
 		OCIImage:               rec.Config.Image,
 		PullPolicy:             gvx.PullNever,
-		RootfsUpperPath:        rootfsPath,
 		Mounts:                 mounts,
 		PortForwards:           ports,
 		Envv:                   rec.Config.Env,
@@ -777,6 +776,11 @@ func sandboxConfig(rec containerRecord, rootfsPath, engineSocket string) (gvx.Co
 			MemoryBytes: rec.HostConfig.Memory,
 			CPUMillis:   rec.HostConfig.NanoCPUs / 1_000_000,
 		},
+	}
+	// A read-only root writes nothing, and gvx refuses a root volume with
+	// ReadOnlyRoot.
+	if !cfg.ReadOnlyRoot {
+		cfg.RootVolume = rootfsPath
 	}
 	if rec.Config.Entrypoint != nil {
 		cfg.Entrypoint = rec.Config.Entrypoint
