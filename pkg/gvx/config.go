@@ -286,13 +286,6 @@ type Config struct {
 	// /workspace when WorkspacePath is set.
 	Mounts []Mount
 
-	// RootfsUpperPath is the host path of an ext4lite image that stores the
-	// writes of the guest to its root file system. New creates a missing image
-	// file, but not its directory. The image persists the changes across runs
-	// of the same image. The empty string keeps the writes in memory. It needs
-	// an image, and it does not support checkpoint and restore.
-	RootfsUpperPath string
-
 	// ReadOnlyRoot mounts the root file system of the guest in read-only mode
 	// after the guest setup. /proc, /sys, /dev, /dev/shm, /dev/pts, and every
 	// mount of WorkspacePath and Mounts keep their own access flags.
@@ -566,12 +559,6 @@ func (c *Config) normalizeWithMode(hasManifestLayers bool) error {
 	}
 	if c.AutoPublishPorts && c.NetworkMode != NetModeNAT {
 		return fmt.Errorf("%w: auto-publishing guest ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
-	}
-	if c.RootfsUpperPath != "" && c.OCIImage == "" && len(c.OCILayerTars) == 0 {
-		return fmt.Errorf("%w: RootfsUpperPath needs an image", ErrInvalidConfig)
-	}
-	if c.RootfsUpperPath != "" && (c.CheckpointDir != "" || c.CheckpointListener != nil) {
-		return fmt.Errorf("%w: RootfsUpperPath does not support checkpoint and restore", ErrInvalidConfig)
 	}
 	if err := c.validateMounts(); err != nil {
 		return err

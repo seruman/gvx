@@ -626,7 +626,7 @@ func TestSandboxArchiveRoundTripsInIdleGuest(t *testing.T) {
 	upper := filepath.Join(t.TempDir(), "rootfs.ext4")
 	cfg := hostTestConfig(t)
 	cfg.OCILayerTars = [][]byte{layer}
-	cfg.RootfsUpperPath = upper
+	cfg.RootVolume = upper
 	cfg.Idle = true
 	sb, err := New(context.Background(), cfg)
 	if err != nil {
@@ -707,7 +707,7 @@ func TestSandboxArchiveRoundTripsInIdleGuest(t *testing.T) {
 
 	cfg = hostTestConfig(t)
 	cfg.OCILayerTars = [][]byte{layer}
-	cfg.RootfsUpperPath = upper
+	cfg.RootVolume = upper
 	cfg.Argv = []string{"/bin/cat", "/srv/app/run.sh"}
 	if code, stdout, stderr := runConfig(t, cfg); code != 0 || stdout != "hello" {
 		t.Fatalf("later run = %d %q (stderr %q), want 0 hello", code, stdout, stderr)
@@ -736,7 +736,7 @@ func TestSandboxProcessesUsageAndUpperArchive(t *testing.T) {
 	cfg := hostTestConfig(t)
 	cfg.NetworkMode = NetModeNAT
 	cfg.OCILayerTars = [][]byte{layer}
-	cfg.RootfsUpperPath = filepath.Join(t.TempDir(), "rootfs.ext4")
+	cfg.RootVolume = filepath.Join(t.TempDir(), "rootfs.ext4")
 	cfg.Argv = []string{"/bin/server"}
 	sb, err := New(context.Background(), cfg)
 	if err != nil {
@@ -971,7 +971,7 @@ func TestSandboxFailedRunReleasesTheRootUpperLayer(t *testing.T) {
 	}
 	cfg := hostTestConfig(t)
 	cfg.OCILayerTars = [][]byte{layer}
-	cfg.RootfsUpperPath = filepath.Join(t.TempDir(), "rootfs.ext4")
+	cfg.RootVolume = filepath.Join(t.TempDir(), "rootfs.ext4")
 	cfg.Argv = []string{"/bin/missing"}
 	sb, err := New(context.Background(), cfg)
 	if err != nil {
