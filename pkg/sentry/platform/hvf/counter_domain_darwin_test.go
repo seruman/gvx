@@ -16,34 +16,52 @@ package hvf
 
 import (
 	"testing"
-	_ "unsafe" // for go:linkname
+	"unsafe"
+
+	"z.gfire.dev/gvx/internal/xsys/unix"
 )
 
 // insnMrsX1CNTVCT is MRS X1, CNTVCT_EL0.
 const insnMrsX1CNTVCT uint32 = 0xd53be041
 
-//go:linkname runtimeNanotime runtime.nanotime
-func runtimeNanotime() int64
+// libSystemSymbol returns the address of a libSystem function.
+func libSystemSymbol(t *testing.T, name string) uintptr {
+	t.Helper()
+	path, _ := unix.BytePtrFromString("/usr/lib/libSystem.B.dylib")
+	handle, _, _ := darwinSyscall6(addrOfDlopen(), uintptr(unsafe.Pointer(path)), rtldLazy, 0, 0, 0, 0)
+	if handle == 0 {
+		t.Fatal("dlopen libSystem failed")
+	}
+	cname, _ := unix.BytePtrFromString(name)
+	sym, _, _ := darwinSyscall6(addrOfDlsym(), handle, uintptr(unsafe.Pointer(cname)), 0, 0, 0, 0)
+	if sym == 0 {
+		t.Fatalf("dlsym %s failed", name)
+	}
+	return sym
+}
 
 // TestGuestCounterCountsMachAbsoluteTime pins the counter contract of the
-// guest clock: a guest reads mach_absolute_time ticks (24 MHz on Apple
-// Silicon) from CNTVCT_EL0. The Sentry cycle clock counts the same ticks
-// (pkg/sentry/time/tsc_darwin_arm64.s), so the guest vDSO converts its
-// counter with the parameters that the Sentry calibrates. runtime.nanotime
-// is mach_absolute_time in nanoseconds.
+// guest clock: hv_vcpu.h defines CNTVCT_EL0 as mach_absolute_time() minus
+// the vtimer offset, which hvf sets to zero. The Sentry cycle clock counts
+// the same ticks (pkg/sentry/time), so the guest vDSO converts its counter
+// with the parameters that the Sentry calibrates. The test reads
+// mach_absolute_time itself, so it holds for any timebase.
 func TestGuestCounterCountsMachAbsoluteTime(t *testing.T) {
 	plat := newTestPlatform(t)
+	machAbsoluteTime := libSystemSymbol(t, "mach_absolute_time")
+	now := func() uint64 {
+		v, _, _ := darwinSyscall6(machAbsoluteTime, 0, 0, 0, 0, 0, 0)
+		return uint64(v)
+	}
 	g := newGuest(t, plat, insnMrsX1CNTVCT, insnSVC0)
-	toTicks := func(ns int64) int64 { return ns/1000*24 + ns%1000*24/1000 }
 	for range 20 {
 		g.ac.SetIP(uintptr(guestCodeAddr))
-		before := toTicks(runtimeNanotime())
+		before := now()
 		if sig, _, err := g.switchOnce(); err != nil || sig != nil {
 			t.Fatalf("Switch = (%v, %v)", sig, err)
 		}
-		after := toTicks(runtimeNanotime())
-		// One tick of slack on each side covers the rounding of nanotime.
-		if v := int64(g.regs().Regs[1]); v < before-1 || v > after+1 {
+		after := now()
+		if v := g.regs().Regs[1]; v < before || v > after {
 			t.Fatalf("guest CNTVCT_EL0 = %d, want a value in [%d, %d] of mach_absolute_time", v, before, after)
 		}
 	}
