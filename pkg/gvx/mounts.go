@@ -1013,20 +1013,6 @@ func (s *Sandbox) openMountsWithMode(forRestore bool) error {
 	return nil
 }
 
-// openRootUpper opens the ext4lite image of Config.RootfsUpperPath before the
-// host lockdown.
-func (s *Sandbox) openRootUpper() error {
-	if s.cfg.RootfsUpperPath == "" {
-		return nil
-	}
-	vol, err := s.openVolumeImage(Mount{Kind: MountVolume, ImagePath: s.cfg.RootfsUpperPath, GuestPath: "/"}, s.cfg.RootfsUpperPath)
-	if err != nil {
-		return fmt.Errorf("gvx: open root upper layer: %w", err)
-	}
-	s.rootUpper = vol
-	return nil
-}
-
 // volumeImagePath returns the absolute host path of the image file of a
 // volume. Two mounts of one image get the same path, so openMounts can refuse
 // the second one.
@@ -1236,13 +1222,7 @@ func (s *Sandbox) closeMounts() error {
 		s.rootVolume = nil
 	}
 	s.workspaces = nil
-	if s.rootUpper != nil {
-		if err := s.rootUpper.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("gvx: close root upper layer: %w", err))
-		}
-	}
 	s.volumes = nil
-	s.rootUpper = nil
 	s.mounts = nil
 	s.workspace = nil
 	s.rootUpperExisting = false

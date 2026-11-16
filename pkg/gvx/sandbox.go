@@ -66,7 +66,6 @@ type Sandbox struct {
 	volumes           []*ext4lite.Volume
 	rootVolume        *ext4lite.Volume
 	rootUpperExisting bool
-	rootUpper         *ext4lite.Volume
 	// upperRoot is the root of the upper layer of the guest root overlay
 	// while the guest runs. ArchiveUpper reads it.
 	upperRoot     vfs.VirtualDentry
@@ -178,9 +177,6 @@ func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	}
 
 	if err := sb.openMounts(); err != nil {
-		return cleanup(err)
-	}
-	if err := sb.openRootUpper(); err != nil {
 		return cleanup(err)
 	}
 

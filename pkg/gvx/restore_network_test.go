@@ -16,9 +16,7 @@ package gvx
 
 import (
 	"context"
-	"errors"
 	"net"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -130,16 +128,5 @@ func TestRestoreClosesTheControlListenerOnEarlyFailure(t *testing.T) {
 	}
 	if counted.closed == 0 {
 		t.Fatal("Restore returned an error and left the control listener open")
-	}
-}
-
-// TestRestoreRejectsARootUpperImage proves that Restore refuses
-// RootfsUpperPath, which a restored guest cannot use, in place of dropping
-// the persistent upper layer without a word.
-func TestRestoreRejectsARootUpperImage(t *testing.T) {
-	cfg := Config{RootfsUpperPath: filepath.Join(t.TempDir(), "rootfs.ext4"), OCILayerTars: [][]byte{{}}}
-	_, err := Restore(context.Background(), cfg, RestoreOptions{Dir: t.TempDir()})
-	if !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("Restore with RootfsUpperPath = %v, want ErrInvalidConfig", err)
 	}
 }

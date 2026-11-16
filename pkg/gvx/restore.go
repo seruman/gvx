@@ -262,11 +262,6 @@ func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, 
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: RestoreOptions.Dir is empty", ErrInvalidConfig)
 	}
-	if cfg.RootfsUpperPath != "" {
-		// A restored guest takes its root file system from the checkpoint,
-		// so it cannot use a persistent upper layer.
-		return nil, fmt.Errorf("%w: Restore does not support RootfsUpperPath", ErrInvalidConfig)
-	}
 	manifest, err := readAndParseManifest(opts.Dir)
 	if err != nil {
 		return nil, err

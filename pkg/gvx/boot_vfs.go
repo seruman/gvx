@@ -176,9 +176,9 @@ func (s *Sandbox) mountGuestRoot(sctx gvcontext.Context, vfsObj *vfs.VirtualFile
 		}
 		s.rootUpperExisting = upperExisting
 	} else {
-		upperFS, upperRootDentry, err := s.rootUpperFilesystem(sctx, vfsObj, creds)
+		upperFS, upperRootDentry, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
 		}
 		upperMnt := vfsObj.NewDisconnectedMount(upperFS, upperRootDentry, &vfs.MountOptions{})
 		upperFS.DecRef(sctx)
@@ -310,25 +310,6 @@ func clearDirContents(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, cre
 		}
 	}
 	return nil
-}
-
-// rootUpperFilesystem returns the upper layer of the root overlay: the
-// ext4lite image of Config.RootfsUpperPath, or a tmpfs.
-func (s *Sandbox) rootUpperFilesystem(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*vfs.Filesystem, *vfs.Dentry, error) {
-	if s.rootUpper != nil {
-		fs, root, err := ext4lite.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", vfs.GetFilesystemOptions{
-			InternalData: ext4lite.InternalFilesystemOptions{Volume: s.rootUpper, UniqueID: "/"},
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("gvx: create ext4lite upper layer: %w", err)
-		}
-		return fs, root, nil
-	}
-	fs, root, err := tmpfs.FilesystemType{}.GetFilesystem(sctx, vfsObj, creds, "", rootUpperOptions)
-	if err != nil {
-		return nil, nil, fmt.Errorf("gvx: create tmpfs upper layer: %w", err)
-	}
-	return fs, root, nil
 }
 
 // mountEROFSLowerLayers mounts each EROFS layer from top to bottom and returns
