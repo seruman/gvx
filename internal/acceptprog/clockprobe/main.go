@@ -22,6 +22,9 @@
 //	unix_ns       the wall time of the guest, in nanoseconds since the epoch
 //	sleep_ms      a 200 ms sleep, timed with time.Now
 //	monotonic_ok  1 when 100000 reads of time.Now never went back
+//
+// With the argument "boot", it prints only boot_vdso_ready and
+// boot_vdso_realtime_ready, read before any wait.
 package main
 
 import (
@@ -90,6 +93,17 @@ func vdsoParamPage() uintptr {
 }
 
 func main() {
+	// With the argument "boot", the probe reports the ready flags of the
+	// vDSO parameter page at once, before any wait, and exits.
+	if len(os.Args) > 1 && os.Args[1] == "boot" {
+		ready, realtimeReady := uint64(0), uint64(0)
+		if p := vdsoParamPage(); p != 0 {
+			ready = *(*uint64)(unsafe.Pointer(p + 8))
+			realtimeReady = *(*uint64)(unsafe.Pointer(p + 40))
+		}
+		fmt.Printf("boot_vdso_ready=%d\nboot_vdso_realtime_ready=%d\n", ready, realtimeReady)
+		return
+	}
 	// With the argument "wait", the probe prints "waiting" and reads one
 	// line of stdin before it measures. A checkpoint test stops the guest
 	// there, so the measurement runs in the restored guest.

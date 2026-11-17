@@ -18,10 +18,12 @@ package gvx
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"z.gfire.dev/gvx/internal/acceptprog"
+	sentrytime "z.gfire.dev/gvx/pkg/sentry/time"
 )
 
 // TestGuestClockUsesTheVDSO runs a guest that reads the time in a loop. The
@@ -36,4 +38,27 @@ func TestGuestClockUsesTheVDSO(t *testing.T) {
 		t.Fatalf("clockprobe exited %d: %s", code, stderr)
 	}
 	checkClockProbe(t, stdout, time.Now().UnixNano(), true)
+}
+
+// TestGuestClockIsReadyAtBoot reads the vDSO parameter page at the first
+// instruction of the guest program. The page must be ready then: a guest
+// that reads the time through system calls for its first second makes
+// thousands of them, as node does at startup.
+func TestGuestClockIsReadyAtBoot(t *testing.T) {
+	requireGuestBackend(t)
+	if !sentrytime.GuestCounterReady() {
+		t.Skip("the host cycle clock cannot serve the guest counter")
+	}
+	cfg := hostTestConfig(t)
+	cfg.BinaryPath = acceptprog.BuildClockProbe(t, runtime.GOARCH)
+	cfg.Argv = []string{"boot"}
+	code, stdout, stderr := runConfig(t, cfg)
+	if code != 0 {
+		t.Fatalf("clockprobe exited %d: %s", code, stderr)
+	}
+	for _, want := range []string{"boot_vdso_ready=1", "boot_vdso_realtime_ready=1"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("clockprobe boot = %q, want %s", stdout, want)
+		}
+	}
 }
