@@ -101,3 +101,27 @@ func TestStraceSummaryCountsEachSandboxApart(t *testing.T) {
 		}
 	}
 }
+
+// TestProfileLogsTheExitsOfTheGuest runs a guest on hvf with GVX_PROFILE=1.
+// The kernel log must hold the exit profile with a system call row.
+func TestProfileLogsTheExitsOfTheGuest(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("only the hvf platform keeps an exit profile")
+	}
+	t.Setenv("GVX_PROFILE", "1")
+	elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, staticBase(), 0, "profiled\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kernelLog syncBuffer
+	cfg := hostTestConfig(t)
+	cfg.ELFBytes = elf
+	cfg.DebugLog = &kernelLog
+	if code, stdout, stderr := runConfig(t, cfg); code != 0 || stdout != "profiled\n" {
+		t.Fatalf("run = (%d, %q, stderr=%q), want (0, %q)", code, stdout, stderr, "profiled\n")
+	}
+	out := kernelLog.String()
+	if !regexp.MustCompile(`hvf profile: switches=[1-9][0-9]* `).MatchString(out) || !regexp.MustCompile(`hvf profile: +[1-9][0-9]*  syscall`).MatchString(out) {
+		t.Fatalf("the kernel log has no hvf profile with a system call row:\n%s", out)
+	}
+}

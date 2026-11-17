@@ -319,6 +319,9 @@ func openHVF() (platform.Platform, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("gvx: open %s backend: %w", hvf.PlatformName, err)
 	}
+	if os.Getenv("GVX_PROFILE") != "" {
+		p.EnableProfile()
+	}
 	return p, hvf.PlatformName, nil
 }
 
