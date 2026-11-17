@@ -249,6 +249,7 @@ func (s *Sandbox) openManifestLayers(digests []string) (err error) {
 // closes them.
 func Restore(ctx context.Context, cfg Config, opts RestoreOptions) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
+	enableStraceFromEnv()
 	for _, ln := range []net.Listener{cfg.CheckpointListener, cfg.ControlListener} {
 		if ln == nil {
 			continue
