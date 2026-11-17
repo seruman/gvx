@@ -59,6 +59,8 @@ type syncState struct {
 
 // archWorker is the ARM64 state that only the worker thread touches.
 type archWorker struct {
+	// prof is the profile of the current Switch, or nil.
+	prof       *exitProfile
 	ttbr0      uint64
 	ttbr0Valid bool
 	// needsReset means the vCPU does not wait at the reload stub, so the next
@@ -242,7 +244,9 @@ func (w *vcpuWorker) runSwitch(r *switchReq) (*linux.SignalInfo, hostarch.Access
 	if err := w.loadContext(comm, ac); err != nil {
 		return nil, hostarch.NoAccess, err
 	}
+	w.prof = r.prof
 	info, at, err := w.runLoop(c, pt, ac)
+	w.prof = nil
 	w.storeContext(comm, ac)
 	return info, at, err
 }
@@ -268,7 +272,9 @@ func (w *vcpuWorker) runLoop(c *Context, pt *stage1Tables, ac *arch.Context64) (
 		if !w.beginRun(pt) {
 			continue
 		}
+		runStart := w.prof.now()
 		runErr := hvVCPURun(w.id)
+		w.prof.addGuest(runStart)
 		w.exits.Add(1)
 		w.inGuest.Store(false)
 		if runErr != nil {
@@ -365,6 +371,7 @@ func (w *vcpuWorker) dispatchExit(c *Context, pt *stage1Tables, ac *arch.Context
 	}
 	switch w.exit.reason {
 	case hvExitReasonCanceled:
+		w.prof.addExit(ExitCancel)
 		return w.onCancel(c, pt)
 	case hvExitReasonException:
 		if hvcommon.ESREC(w.exit.syndrome) == hvcommon.ECHVC64 {
@@ -379,6 +386,7 @@ func (w *vcpuWorker) dispatchExit(c *Context, pt *stage1Tables, ac *arch.Context
 		// probable cause. The vCPU keeps its registers across the exit. A real
 		// fault repeats on the next entry and then reports its own reason, so a
 		// resume loses nothing.
+		w.prof.addExit(ExitOther)
 		w.unknownExits++
 		if w.unknownExits > maxUnknownExits {
 			w.invalidateState()
@@ -454,6 +462,7 @@ func (w *vcpuWorker) onCancel(c *Context, pt *stage1Tables) (bool, *linux.Signal
 func (w *vcpuWorker) onStubExit(ac *arch.Context64) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
 	comm := w.comm.view
 	act := decodeStubExit(comm.Vector, comm.ESR, comm.FaultAddr, comm.PC, comm.SP)
+	w.prof.addExit(exitClassOf(act.kind))
 	if comm.Vector == vecLowerELSync {
 		w.guestRan()
 	} else {
@@ -496,6 +505,7 @@ func (w *vcpuWorker) onStubExit(ac *arch.Context64) (bool, *linux.SignalInfo, ho
 func (w *vcpuWorker) onHypervisorException() (bool, *linux.SignalInfo, hostarch.AccessType, error) {
 	exit := w.exit
 	act := decodeHypervisorExit(exit.syndrome, exit.virtualAddress, exit.physicalAddress)
+	w.prof.addExit(exitClassOf(act.kind))
 	cpsr, err := hvGetReg(w.id, hvRegCPSR)
 	if err != nil {
 		w.invalidateState()

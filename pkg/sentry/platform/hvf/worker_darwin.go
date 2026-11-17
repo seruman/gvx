@@ -97,6 +97,8 @@ type switchReq struct {
 	c   *Context
 	as  *AddressSpace
 	ac  *arch.Context64
+	// prof receives the exit counts of this Switch; nil counts nothing.
+	prof *exitProfile
 
 	info *linux.SignalInfo
 	at   hostarch.AccessType
@@ -564,7 +566,7 @@ func (v *vmState) concurrency() int {
 }
 
 // switchContext runs one guest slice of c on a pooled vCPU.
-func (v *vmState) switchContext(ctx context.Context, mm platform.MemoryManager, c *Context, as *AddressSpace, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (v *vmState) switchContext(ctx context.Context, mm platform.MemoryManager, c *Context, as *AddressSpace, ac *arch.Context64, prof *exitProfile) (*linux.SignalInfo, hostarch.AccessType, error) {
 	w, err := v.pool.acquire(c)
 	if err != nil {
 		if errors.Is(err, errInterruptedWait) {
@@ -579,7 +581,7 @@ func (v *vmState) switchContext(ctx context.Context, mm platform.MemoryManager, 
 	c.hw.mu.Unlock()
 
 	r := &c.hw.req
-	r.ctx, r.mm, r.c, r.as, r.ac = ctx, mm, c, as, ac
+	r.ctx, r.mm, r.c, r.as, r.ac, r.prof = ctx, mm, c, as, ac, prof
 	r.done.Store(0)
 	w.submit(r)
 	r.await()
@@ -590,6 +592,6 @@ func (v *vmState) switchContext(ctx context.Context, mm platform.MemoryManager, 
 	v.pool.release(w)
 
 	info, at, err := r.info, r.at, r.err
-	r.ctx, r.mm, r.c, r.as, r.ac, r.info, r.err = nil, nil, nil, nil, nil, nil, nil
+	r.ctx, r.mm, r.c, r.as, r.ac, r.prof, r.info, r.err = nil, nil, nil, nil, nil, nil, nil, nil
 	return info, at, err
 }

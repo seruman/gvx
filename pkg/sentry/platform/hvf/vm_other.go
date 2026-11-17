@@ -82,7 +82,7 @@ func (*vmState) retire(pt *stage1Tables) {
 	pt.release()
 }
 
-func (*vmState) switchContext(context.Context, platform.MemoryManager, *Context, *AddressSpace, *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (*vmState) switchContext(context.Context, platform.MemoryManager, *Context, *AddressSpace, *arch.Context64, *exitProfile) (*linux.SignalInfo, hostarch.AccessType, error) {
 	return nil, hostarch.NoAccess, errUnsupportedOS
 }
 
