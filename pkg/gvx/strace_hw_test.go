@@ -17,6 +17,7 @@
 package gvx
 
 import (
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -44,5 +45,59 @@ func TestStraceLogsTheSystemCallsOfTheGuest(t *testing.T) {
 	}
 	if !strings.Contains(kernelLog.String(), " X write(") {
 		t.Fatalf("the kernel log has no exit line of write(2) with GVX_STRACE=1:\n%s", kernelLog.String())
+	}
+}
+
+// TestStraceSummaryCountsTheSystemCallsOfTheGuest runs a guest with
+// GVX_STRACE=summary. The kernel log must hold one summary row for write(2)
+// and a total row, and no line for each call.
+func TestStraceSummaryCountsTheSystemCallsOfTheGuest(t *testing.T) {
+	t.Setenv("GVX_STRACE", "summary")
+	elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, staticBase(), 0, "counted\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kernelLog syncBuffer
+	cfg := hostTestConfig(t)
+	cfg.ELFBytes = elf
+	cfg.DebugLog = &kernelLog
+	code, stdout, stderr := runConfig(t, cfg)
+	if code != 0 || stdout != "counted\n" {
+		t.Fatalf("run = (%d, %q, stderr=%q), want (0, %q)", code, stdout, stderr, "counted\n")
+	}
+	out := kernelLog.String()
+	if !regexp.MustCompile(`strace summary: +1 +[0-9.]+ +[0-9.]+ +0  write\n`).MatchString(out) {
+		t.Fatalf("the kernel log has no summary row of one write(2):\n%s", out)
+	}
+	if !strings.Contains(out, "  total\n") {
+		t.Fatalf("the kernel log has no total row:\n%s", out)
+	}
+	if strings.Contains(out, " X write(") {
+		t.Fatalf("summary mode logged a line for each call:\n%s", out)
+	}
+}
+
+// TestStraceSummaryCountsEachSandboxApart runs two sandboxes one after the
+// other in one process with GVX_STRACE=summary. Each summary must count the
+// one write(2) of its own guest, not the calls of an earlier sandbox.
+func TestStraceSummaryCountsEachSandboxApart(t *testing.T) {
+	t.Setenv("GVX_STRACE", "summary")
+	elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, staticBase(), 0, "apart\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := regexp.MustCompile(`strace summary: +([0-9]+) +[0-9.]+ +[0-9.]+ +[0-9]+  write\n`)
+	for i := range 2 {
+		var kernelLog syncBuffer
+		cfg := hostTestConfig(t)
+		cfg.ELFBytes = elf
+		cfg.DebugLog = &kernelLog
+		if code, stdout, stderr := runConfig(t, cfg); code != 0 || stdout != "apart\n" {
+			t.Fatalf("run %d = (%d, %q, stderr=%q), want (0, %q)", i, code, stdout, stderr, "apart\n")
+		}
+		m := row.FindStringSubmatch(kernelLog.String())
+		if m == nil || m[1] != "1" {
+			t.Fatalf("run %d: write(2) row = %q, want a count of 1:\n%s", i, m, kernelLog.String())
+		}
 	}
 }

@@ -281,7 +281,7 @@ An unmodified `docker:dind` image starts with the default `--iptables=true`. [`r
 
 The exit code 137 has two causes that `rungv` tells apart. A guest that passes `--memory` gets the message about the memory limit. When the engine fails under the guest, the kernel ends the guest with SIGKILL, and `rungv` prints `the execution engine stopped the guest` with the cause. The SDK returns `ErrEngineFault` in that case. A stub process that a virus scanner ended is one example of an engine fault.
 
-`GVX_DEBUG_LOG=1` prints the log of the kernel to the standard error of `rungv`, and the value `2` also prints debug lines. Use it when a guest fails and no message names the cause. `GVX_STRACE=1` also prints each system call of the guest.
+`GVX_DEBUG_LOG=1` prints the log of the kernel to the standard error of `rungv`, and the value `2` also prints debug lines. Use it when a guest fails and no message names the cause. `GVX_STRACE=1` also prints each system call of the guest. `GVX_STRACE=summary` prints one table when the guest ends: the count, the total time, the mean time, and the error count of each system call, the largest total time first.
 
 ### 4.10 Host root certificates
 
