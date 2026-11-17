@@ -124,14 +124,26 @@ func initRuntimeGlobals() {
 		if os.Getenv("GVX_DEBUG_LOG") == "2" {
 			log.SetLevel(log.Debug)
 		}
-		if os.Getenv("GVX_STRACE") != "" {
-			strace.Initialize()
-			strace.EnableAll(strace.SinkTypeLog)
-		}
 		cpuid.Initialize()
 		_ = usage.Init()
 		if usage.MemoryAccounting == nil {
 			usage.MemoryAccounting = usage.NewMemoryLocked()
+		}
+	})
+}
+
+// straceOnce turns on the system call trace once for each process.
+var straceOnce sync.Once
+
+// enableStraceFromEnv logs every system call of each guest when GVX_STRACE
+// is set. New and Restore call it, not package initialization: the init
+// functions of keyctl.go and reboot.go rebuild the system call tables, which
+// clears the trace flags of every earlier call.
+func enableStraceFromEnv() {
+	straceOnce.Do(func() {
+		if os.Getenv("GVX_STRACE") != "" {
+			strace.Initialize()
+			strace.EnableAll(strace.SinkTypeLog)
 		}
 	})
 }
