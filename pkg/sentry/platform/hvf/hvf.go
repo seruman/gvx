@@ -51,6 +51,9 @@ type Platform struct {
 	vm        *vmState
 	closeOnce sync.Once
 	closeErr  error
+	// profile holds the exit counters after EnableProfile, and is nil
+	// before.
+	profile atomic.Pointer[exitProfile]
 }
 
 type constructor struct{}
@@ -202,7 +205,11 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 	if as == nil {
 		return nil, hostarch.NoAccess, errNoAddressSpace
 	}
-	return c.platform.vm.switchContext(ctx, mm, c, as, ac)
+	prof := c.platform.profile.Load()
+	start := prof.now()
+	info, at, err := c.platform.vm.switchContext(ctx, mm, c, as, ac, prof)
+	prof.addSwitch(start)
+	return info, at, err
 }
 
 // PullFullState implements platform.Context.PullFullState. It does nothing
