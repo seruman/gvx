@@ -445,6 +445,13 @@ var boundaryRules = []importRule{
 		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{
+		// gvxbench drives rungv and docker as processes; it imports no gvx
+		// package.
+		pkg:       "tools/gvxbench",
+		tier:      Tier1Additive,
+		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "scripts/*", "runsc/*", "shim/*"},
+	},
+	{
 		pkg:       "tools/androidprobe",
 		tier:      Tier1Additive,
 		subtree:   true,
