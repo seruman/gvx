@@ -5,6 +5,7 @@ package pgalloc
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -371,6 +372,8 @@ func TestDecommitUnalignedRangePunchesInteriorHostPages(t *testing.T) {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
 	defer mf.Destroy()
+	// This test covers the hole punch, which the default file skips for small ranges.
+	mf.decommit.punchAll = true
 
 	page := uint64(hostarch.PageSize)
 	hostPage := uint64(unix.Getpagesize())
@@ -435,6 +438,8 @@ func TestReleaseSubPagesCoalescesIntoWholeHostPageHolePunch(t *testing.T) {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
 	defer mf.Destroy()
+	// This test covers the hole punch, which the default file skips for small ranges.
+	mf.decommit.punchAll = true
 
 	page := uint64(hostarch.PageSize)
 	hostPage := uint64(unix.Getpagesize())
@@ -498,5 +503,74 @@ func TestReleaseSubPagesCoalescesIntoWholeHostPageHolePunch(t *testing.T) {
 	}
 	if after >= before {
 		t.Fatalf("TotalUsage after releasing all sub-pages = %d, want less than %d", after, before)
+	}
+}
+
+// residentHostPages reports how many host pages of bs are resident. The
+// mincore wrapper writes one byte for each 4 KB page.
+func residentHostPages(t *testing.T, bs []byte) int {
+	t.Helper()
+	vec := make([]byte, len(bs)/hostarch.PageSize)
+	if err := mincore(bs, vec); err != nil {
+		t.Fatalf("mincore: %v", err)
+	}
+	n := 0
+	for _, v := range vec {
+		n += int(v & 1)
+	}
+	return n * hostarch.PageSize / unix.Getpagesize()
+}
+
+// TestDecommitZeroesSmallRangesAndPunchesLargeOnes verifies the release policy
+// on macOS. A hole punch on APFS costs about 30 us for 16 KB and the next
+// touch faults again, so a small range is zeroed in place. A large range still
+// returns its pages to the host.
+func TestDecommitZeroesSmallRangesAndPunchesLargeOnes(t *testing.T) {
+	t.Parallel()
+	mf, err := NewDefaultMemoryFile(MemoryFileOpts{DisableMemoryAccounting: true})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	for _, tc := range []struct {
+		name     string
+		length   uint64
+		resident bool
+	}{
+		{name: "small", length: 64 << 10, resident: true},
+		{name: "at limit", length: maxZeroedDecommit, resident: true},
+		{name: "large", length: 4 << 20, resident: false},
+	} {
+		fr, err := mf.Allocate(tc.length, AllocOpts{Kind: usage.Anonymous})
+		if err != nil {
+			t.Fatalf("%s: Allocate: %v", tc.name, err)
+		}
+		bs, err := mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			t.Fatalf("%s: MapInternal: %v", tc.name, err)
+		}
+		slice := bs.Head().ToSlice()
+		if uint64(len(slice)) != tc.length {
+			t.Fatalf("%s: mapping spans %d bytes, want %d", tc.name, len(slice), tc.length)
+		}
+		for i := range slice {
+			slice[i] = 0x7F
+		}
+		mf.Decommit(fr)
+		// Measure residency before any read: a read faults a page back in.
+		got := residentHostPages(t, slice)
+		all := len(slice) / unix.Getpagesize()
+		if tc.resident && got != all {
+			t.Errorf("%s: %d of %d host pages resident after Decommit, want all (zeroed in place)", tc.name, got, all)
+		}
+		if !tc.resident && got != 0 {
+			t.Errorf("%s: %d of %d host pages resident after Decommit, want 0 (hole punched)", tc.name, got, all)
+		}
+		// Read the bytes only after the residency check: a read faults pages in.
+		if i := slices.IndexFunc(slice, func(b byte) bool { return b != 0 }); i >= 0 {
+			t.Fatalf("%s: slice[%d] = %#x after Decommit, want 0", tc.name, i, slice[i])
+		}
+		mf.DecRef(fr)
 	}
 }

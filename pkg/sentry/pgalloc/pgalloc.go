@@ -62,6 +62,7 @@ type MemoryFile struct {
 	// platforms map the pages themselves.
 	hostWrites  hostWriteHooks
 	saveRestore saveRestoreXplat
+	decommit    decommitPolicy
 
 	// MemoryFile owns a single backing file. Each page in the backing file is
 	// considered "committed" or "uncommitted". A page is committed if the host

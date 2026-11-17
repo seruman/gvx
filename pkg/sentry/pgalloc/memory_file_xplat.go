@@ -64,8 +64,14 @@ func (f *MemoryFile) expandReleaseRangeLocked(fr memmap.FileRange) memmap.FileRa
 }
 
 // decommitRange punches holes for whole host pages in fr with f.decommitFile
-// and zeroes any unaligned sub-host-page head or tail in memory.
+// and zeroes any unaligned sub-host-page head or tail in memory. A range of at
+// most maxZeroedDecommit bytes is zeroed in place instead, unless
+// f.decommit.punchAll is set.
 func (f *MemoryFile) decommitRange(fr memmap.FileRange) {
+	if fr.Length() <= maxZeroedDecommit && !f.decommit.punchAll && !f.opts.DiskBackedFile {
+		f.manuallyZero(fr)
+		return
+	}
 	hostPage := uint64(unix.Getpagesize())
 	if hostPage <= uint64(hostarch.PageSize) {
 		if err := f.decommitFile(fr); err != nil {
