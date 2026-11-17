@@ -42,7 +42,6 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
-	"z.gfire.dev/gvx/pkg/sentry/strace"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/sentry/watchdog"
@@ -128,22 +127,6 @@ func initRuntimeGlobals() {
 		_ = usage.Init()
 		if usage.MemoryAccounting == nil {
 			usage.MemoryAccounting = usage.NewMemoryLocked()
-		}
-	})
-}
-
-// straceOnce turns on the system call trace once for each process.
-var straceOnce sync.Once
-
-// enableStraceFromEnv logs every system call of each guest when GVX_STRACE
-// is set. New and Restore call it, not package initialization: the init
-// functions of keyctl.go and reboot.go rebuild the system call tables, which
-// clears the trace flags of every earlier call.
-func enableStraceFromEnv() {
-	straceOnce.Do(func() {
-		if os.Getenv("GVX_STRACE") != "" {
-			strace.Initialize()
-			strace.EnableAll(strace.SinkTypeLog)
 		}
 	})
 }
@@ -615,6 +598,8 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 // executeActiveKernel starts k, attaches the watchdog and memory guard, waits
 // for guest exit or cancellation, and translates the exit status.
 func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, mf *pgalloc.MemoryFile, hostRAM uint64, startErrPrefix string) (int, error) {
+	startKernelTrace(k, traceModeFromEnv())
+	defer endKernelTrace(k)
 	if err := k.Start(); err != nil {
 		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
 	}

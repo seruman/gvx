@@ -124,7 +124,6 @@ type Sandbox struct {
 // fails, it closes the listener.
 func New(ctx context.Context, cfg Config) (_ *Sandbox, retErr error) {
 	initRuntimeGlobals()
-	enableStraceFromEnv()
 	if ln := cfg.CheckpointListener; ln != nil {
 		defer func() {
 			if retErr != nil {

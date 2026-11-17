@@ -956,6 +956,7 @@ A guest must never see or change the state of another sandbox. State of the host
 | `systrap` `disableSyscallPatching` and `neverEnableFastPath` | `platform/systrap` | Only the options `DisableSyscallPatching` and `DisableFastPath` set them, and `gvx` sets neither. |
 | `pgalloc` `mlockDisabled` and `madvPopulateWriteDisabled`, and the capability flags of `kvm` | `pgalloc`, `platform/kvm` | They record what the host kernel refused. |
 | `memutil` arena registry, sequence counters of `hostfs`, `blockdev` clock | `memutil`, `fsimpl/hostfs`, `blockdev` | They index host address ranges, make unique host file names, or read the monotonic clock. |
+| The `Stracer` and trace flags of each system call table | `kernel`, `pkg/gvx/strace_summary.go` | The tables are process-wide. The tracer keys the counts of `GVX_STRACE=summary` by the kernel of the task, so each sandbox counts only its own calls. |
 | `kernel.lastPIDNSID` | `kernel` | It makes the identifier of each PID namespace unique. No guest reads it. |
 | `time.tscOffset` | `time` | Only the restore of a KVM sandbox in `runsc` sets it. `gvx` never calls `SetTSCOffset`. |
 | `seccheck.Global`, `nftables.enableNFTables`, `afsSyscallPanic`, `gofer.globalDentryCache`, `netfilter.chainCounter`, the plugin network stack, and the RDMA snapshot | Sentry packages | The `runsc` boot code sets them, and `gvx` never does. Do not set them in a process that runs more than one sandbox. |
