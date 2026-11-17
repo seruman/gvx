@@ -32,7 +32,7 @@ func newGuestClocks() sentrytime.Clocks {
 
 func guestClocksFor(c sentrytime.Clocks, counterReady bool) sentrytime.Clocks {
 	if counterReady {
-		return c
+		return withExactCounterRate(c)
 	}
 	warnSyscallClockOnce.Do(func() {
 		log.Warningf("gvx: the host cycle clock cannot serve the guest counter; guest clock reads use system calls")
