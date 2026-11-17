@@ -229,3 +229,20 @@ func (c *syscallCounts) table(name func(uintptr) string) []string {
 	}
 	return lines
 }
+
+// profiledPlatform is a platform that counts its exits, such as hvf with
+// GVX_PROFILE set.
+type profiledPlatform interface {
+	ProfileLines() []string
+}
+
+// logPlatformProfile logs the exit profile of p when p keeps one.
+func logPlatformProfile(p any) {
+	pp, ok := p.(profiledPlatform)
+	if !ok {
+		return
+	}
+	for _, line := range pp.ProfileLines() {
+		log.Infof("%s", line)
+	}
+}

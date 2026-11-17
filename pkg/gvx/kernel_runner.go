@@ -600,6 +600,7 @@ func (s *Sandbox) runRestoredKernel(ctx context.Context) (int, error) {
 func (s *Sandbox) executeActiveKernel(ctx context.Context, k *kernel.Kernel, tg *kernel.ThreadGroup, mf *pgalloc.MemoryFile, hostRAM uint64, startErrPrefix string) (int, error) {
 	startKernelTrace(k, traceModeFromEnv())
 	defer endKernelTrace(k)
+	defer logPlatformProfile(s.plat)
 	if err := k.Start(); err != nil {
 		return 1, fmt.Errorf("%s: %w", startErrPrefix, err)
 	}
