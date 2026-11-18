@@ -181,7 +181,7 @@ var boundaryRules = []importRule{
 	{
 		pkg:               "cmd/rungv",
 		tier:              Tier1Additive,
-		allowed:           []string{"pkg/gvx", "pkg/oci"},
+		allowed:           []string{"pkg/gvx", "pkg/oci", "internal/cpuprofile"},
 		forbidden:         []string{pkgSentryAll, "pkg/hostlockdown/*", "pkg/netbackend/*", "internal/gvxshim/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 		forbiddenLiterals: []string{winHvDLL},
 	},
@@ -347,6 +347,12 @@ var boundaryRules = []importRule{
 		tier:      Tier1Additive,
 		allowed:   []string{xSysWindows},
 		forbidden: []string{"cmd/*", "internal/gvxshim/*", "tools/*", "scripts/*", "runsc/*", "shim/*", "pkg/sentry/kernel/*", "pkg/sentry/platform/*", "pkg/hostlockdown/*"},
+	},
+	{
+		// cpuprofile wraps runtime/pprof; it imports no gvx package.
+		pkg:       "internal/cpuprofile",
+		tier:      Tier1Additive,
+		forbidden: []string{"pkg/*", "cmd/*", "internal/*", "e2e/*", "tools/*", "scripts/*", "runsc/*", "shim/*"},
 	},
 	{
 		pkg:       "internal/weakmap",
