@@ -77,6 +77,7 @@ func executeCLI(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	}
 
 	streams := cliIO{stdin: stdin, stdout: stdout, stderr: stderr}
+	defer startCPUProfile(stderr)()
 	subcmd := args[0]
 	switch subcmd {
 	case "-h", "--help", "help":
