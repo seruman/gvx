@@ -67,10 +67,22 @@ func spinShouldYield(procs int, elapsed time.Duration) bool {
 	return procs <= 2 || elapsed >= spinYieldAfter
 }
 
+// workerSpinShouldYield is the yield rule of an idle vCPU worker. The worker
+// holds a locked OS thread. A yield of a locked goroutine parks its thread and
+// hands the processor to another thread, and the next request must wake the
+// parked thread again: a CPU profile of go build showed a quarter of the
+// samples in that park and wake. With GOMAXPROCS of 3 or more, the Switch
+// caller has a processor of its own, so the worker never yields while it
+// spins. With 1 or 2 processors, the caller may need the processor of the
+// worker, so the worker yields at once.
+func workerSpinShouldYield(procs int, _ time.Duration) bool {
+	return procs <= 2
+}
+
 // spinWait polls done until it returns true or the budget ends. It yields the
-// processor as spinShouldYield decides, so a spinning goroutine cannot starve
+// processor as shouldYield decides, so a spinning goroutine cannot starve
 // the goroutine it waits for when GOMAXPROCS is small.
-func spinWait(budget time.Duration, done func() bool) bool {
+func spinWait(budget time.Duration, done func() bool, shouldYield func(procs int, elapsed time.Duration) bool) bool {
 	procs := runtime.GOMAXPROCS(0)
 	start := time.Now()
 	for i := 1; ; i++ {
@@ -82,7 +94,7 @@ func spinWait(budget time.Duration, done func() bool) bool {
 			if elapsed >= budget {
 				return false
 			}
-			if i&1023 == 0 && spinShouldYield(procs, elapsed) {
+			if i&1023 == 0 && shouldYield(procs, elapsed) {
 				runtime.Gosched()
 			}
 		}
@@ -245,7 +257,7 @@ func (w *vcpuWorker) nextRequest() *switchReq {
 			return nil
 		}
 		ready := func() bool { return w.req.Load() != nil || w.quit.Load() }
-		if spinWait(workerSpin, ready) {
+		if spinWait(workerSpin, ready, workerSpinShouldYield) {
 			continue
 		}
 		w.asleep.Store(true)
@@ -259,7 +271,7 @@ func (w *vcpuWorker) nextRequest() *switchReq {
 // await waits for the worker to finish a request.
 func (r *switchReq) await() {
 	finished := func() bool { return r.done.Load() != 0 }
-	if spinWait(callerSpin, finished) {
+	if spinWait(callerSpin, finished, spinShouldYield) {
 		return
 	}
 	r.parked.Store(1)

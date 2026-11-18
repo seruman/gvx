@@ -45,3 +45,26 @@ func TestSpinYieldRule(t *testing.T) {
 		}
 	}
 }
+
+// TestWorkerSpinYieldRule pins the yield rule of an idle vCPU worker. The
+// worker holds a locked OS thread, so a yield parks that thread and the next
+// request must wake it: a CPU profile of go build showed a quarter of the
+// samples in that park and wake. With GOMAXPROCS of 3 or more, the worker
+// never yields during its spin. With 1 or 2 processors, the Switch caller
+// may need the processor of the worker, so the worker yields at once.
+func TestWorkerSpinYieldRule(t *testing.T) {
+	for _, tc := range []struct {
+		procs   int
+		elapsed time.Duration
+		want    bool
+	}{
+		{procs: 1, elapsed: 0, want: true},
+		{procs: 2, elapsed: time.Microsecond, want: true},
+		{procs: 3, elapsed: spinYieldAfter, want: false},
+		{procs: 18, elapsed: workerSpin, want: false},
+	} {
+		if got := workerSpinShouldYield(tc.procs, tc.elapsed); got != tc.want {
+			t.Errorf("workerSpinShouldYield(%d, %v) = %v, want %v", tc.procs, tc.elapsed, got, tc.want)
+		}
+	}
+}
