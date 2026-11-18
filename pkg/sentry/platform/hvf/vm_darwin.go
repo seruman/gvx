@@ -95,6 +95,9 @@ func acquireVM() (*vmState, error) {
 		return nil, fmt.Errorf("hvf: previous VM could not be destroyed: %w", vmGlobal.deathErr)
 	}
 	if vmGlobal.vm == nil {
+		if err := liftProcessCPULimit(); err != nil {
+			return nil, err
+		}
 		if err := createVMWithEntitlement(); err != nil {
 			return nil, err
 		}
