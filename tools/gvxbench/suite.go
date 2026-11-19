@@ -20,8 +20,8 @@ package main
 type Workload struct {
 	// Name is the metric name, unique in the suite.
 	Name string
-	// Tier groups workloads: "micro" runs the micro-benchmark guest, "tool"
-	// runs a short command in a small image, "app" runs a real workload.
+	// Tier groups workloads: "tool" runs a short command in a small image,
+	// "app" runs a real workload.
 	Tier string
 	// Image is a digest-pinned image reference. The digest fixes the bytes
 	// that the workload runs, so a baseline stays valid when a tag moves.

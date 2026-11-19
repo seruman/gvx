@@ -97,13 +97,12 @@ func TestMedian(t *testing.T) {
 	}
 }
 
-func TestParseMicroReadsResultsAndRejectsErrors(t *testing.T) {
-	out := []byte("MICROBENCH_INFO {}\nMICROBENCH {\"name\":\"getpid\",\"iters\":10,\"total_ns\":13000,\"ns_per_op\":1300}\nnoise\n")
-	got, err := parseMicro(out)
-	if err != nil || got["getpid"] != 1300 {
-		t.Fatalf("parseMicro = %v, %v, want getpid 1300", got, err)
+func TestParseTiersRejectsUnknownNames(t *testing.T) {
+	got, err := parseTiers("tool, app")
+	if err != nil || !got["tool"] || !got["app"] || len(got) != 2 {
+		t.Fatalf("parseTiers(tool, app) = %v, %v", got, err)
 	}
-	if _, err := parseMicro([]byte("MICROBENCH_ERR fork_wait: EPERM\n")); err == nil {
-		t.Fatal("parseMicro accepted a MICROBENCH_ERR line")
+	if _, err := parseTiers("micro"); err == nil {
+		t.Fatal("parseTiers accepted the removed micro tier")
 	}
 }

@@ -15,13 +15,14 @@
 // Command gvxbench measures gvx on a fixed suite and compares the results
 // with a baseline.
 //
-//	gvxbench run [-engine rungv|docker] [-env NAME] [-o FILE] [-tiers micro,tool,app]
+//	gvxbench run [-engine rungv|docker] [-env NAME] [-o FILE] [-tiers tool,app]
 //	gvxbench compare -baseline FILE -results FILE [-threshold 0.20] [-report-only]
 //	gvxbench compare -paired -base FILE... -head FILE... [-threshold 0.05]
 //
 // "run" times each workload in a fresh container, so a sample includes the
 // start of the sandbox. "compare" exits 1 when a metric is slower than the
-// baseline by more than the threshold, or missing.
+// baseline by more than the threshold, or missing. The syscall
+// micro-benchmarks are TestE2EMicroBench in e2e.
 package main
 
 import (
@@ -77,8 +78,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) error {
 	out := fs.String("o", "", "write the JSON result to this file (default: stdout)")
 	iterations := fs.Int("iterations", 5, "timed samples for each workload")
 	warmup := fs.Int("warmup", 1, "untimed samples before the timed ones")
-	microBench := fs.String("microbench", "", "path of the micro-benchmark guest (built by default)")
-	tiers := fs.String("tiers", "", "comma-separated tiers to run: micro, tool, app (default: all)")
+	tiers := fs.String("tiers", "", "comma-separated tiers to run: tool, app (default: all)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -103,20 +103,12 @@ func cmdRun(args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown engine %q", *engine)
 	}
-	opts := Options{Iterations: *iterations, Warmup: *warmup, Tiers: parseTiers(*tiers),
-		Progress: func(line string) { fmt.Fprintln(stderr, line) }}
-	if len(opts.Tiers) == 0 || opts.Tiers["micro"] {
-		path := *microBench
-		if path == "" {
-			built, cleanup, err := buildMicroBench()
-			if err != nil {
-				return err
-			}
-			defer cleanup()
-			path = built
-		}
-		opts.MicroBench = path
+	selected, err := parseTiers(*tiers)
+	if err != nil {
+		return err
 	}
+	opts := Options{Iterations: *iterations, Warmup: *warmup, Tiers: selected,
+		Progress: func(line string) { fmt.Fprintln(stderr, line) }}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -143,33 +135,20 @@ func cmdRun(args []string, stdout, stderr io.Writer) error {
 	return os.WriteFile(*out, data, 0o644)
 }
 
-func parseTiers(s string) map[string]bool {
+// parseTiers returns the tiers that s names, or nil for all of them.
+func parseTiers(s string) (map[string]bool, error) {
 	if s == "" {
-		return nil
+		return nil, nil
 	}
 	m := map[string]bool{}
 	for _, t := range strings.Split(s, ",") {
-		m[strings.TrimSpace(t)] = true
+		t = strings.TrimSpace(t)
+		if t != "tool" && t != "app" {
+			return nil, fmt.Errorf("unknown tier %q: want tool or app", t)
+		}
+		m[t] = true
 	}
-	return m
-}
-
-// buildMicroBench compiles the micro-benchmark guest of this repository for
-// linux/arm64.
-func buildMicroBench() (string, func(), error) {
-	dir, err := os.MkdirTemp("", "gvxbench-")
-	if err != nil {
-		return "", nil, err
-	}
-	cleanup := func() { _ = os.RemoveAll(dir) }
-	out := dir + "/microbench"
-	cmd := exec.Command("go", "build", "-o", out, "-ldflags=-linkmode=internal", "./internal/acceptprog/microbench")
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
-	if msg, err := cmd.CombinedOutput(); err != nil {
-		cleanup()
-		return "", nil, fmt.Errorf("build the micro-benchmark guest: %w: %s", err, msg)
-	}
-	return out, cleanup, nil
+	return m, nil
 }
 
 func gitCommit() string {
